@@ -1,0 +1,20 @@
+# build output
+bin/
+obj/
+artifacts/
+TestResults/
+web/node_modules/
+
+# runtime data (database, encryption keys) - created on first start
+data/
+Api/data/
+
+# bot secrets and state written by the bots program
+keys.json
+.dca_state.json
+
+# IDEs
+.vs/
+.vscode/
+.idea/
+*.user

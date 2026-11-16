@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/Bots/">
+    <Project Path="Bots/OpenTrade.Bots.csproj" />
+  </Folder>
+  <Folder Name="/Tests/">
+    <Project Path="Tests/OpenTrade.Tests.csproj" />
+  </Folder>
+  <Project Path="OpenTrade.csproj" />
+</Solution>
