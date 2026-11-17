@@ -175,18 +175,18 @@ public class BotEndToEndTests : IClassFixture<ApiFactory>
 
             // no broker yet -> setup explains what to do
             var err = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                Setup.Run(admin, ApiFactory.Email, ApiFactory.Password, Bots(), 9_000, null, keysPath, _ => { }));
+                Setup.Run(admin, ApiFactory.Email, ApiFactory.Password, Bots(), 9, null, keysPath, _ => { }));
             Assert.Contains("Connect broker", err.Message);
 
             Assert.Equal(HttpStatusCode.OK, (await s.Post("/api/brokers", new { name = "Alpaca Paper", keyId = FakeBroker.GoodKeyId, secret = FakeBroker.GoodSecret, paper = true })).StatusCode);
             var bots = Bots();
-            var results = await Setup.Run(admin, ApiFactory.Email, ApiFactory.Password, bots, 9_000, null, keysPath, _ => { });
+            var results = await Setup.Run(admin, ApiFactory.Email, ApiFactory.Password, bots, 9, null, keysPath, _ => { });
             Assert.All(results, r => Assert.StartsWith("created", r.Status));
             var keys = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(keysPath))!;
             Assert.Equal(3, keys.Count);
             Assert.All(keys.Values, k => Assert.StartsWith("ot_test_", k));
             // running setup again does not duplicate anything
-            Assert.All(await Setup.Run(admin, ApiFactory.Email, ApiFactory.Password, bots, 9_000, null, keysPath, _ => { }), r => Assert.StartsWith("already exists", r.Status));
+            Assert.All(await Setup.Run(admin, ApiFactory.Email, ApiFactory.Password, bots, 9, null, keysPath, _ => { }), r => Assert.StartsWith("already exists", r.Status));
             Assert.Equal(3, (await s.Get("/api/bots")).GetProperty("bots").GetArrayLength());
 
             // the bots, using only their API keys
@@ -198,6 +198,10 @@ public class BotEndToEndTests : IClassFixture<ApiFactory>
             Assert.True(await BotRunner.Tick(sma, Client(sma.Name), new BotOptions(["AAPL", "MSFT", "NVDA"], DryRun: true), log.Add, default));
             Assert.Equal(0, _f.Fake.Placed);
             Assert.Contains(log, l => l.Contains("dry run"));
+
+            // the allocation check prices market orders with the latest quote; give the fake broker the same prices the bots see
+            foreach (var sym in new[] { "AAPL", "MSFT", "NVDA" }) _f.Fake.Last[sym] = 44.5m;
+            _f.Fake.Last["DOWNX"] = 41m;
 
             // real run: 3000 USD per symbol at a close of 44.5 -> 67 shares each
             Assert.True(await BotRunner.Tick(sma, Client(sma.Name), new BotOptions(["AAPL", "MSFT", "NVDA"]), log.Add, default));
@@ -248,7 +252,7 @@ public class BotEndToEndTests : IClassFixture<ApiFactory>
         var brokers = await s.Get("/api/brokers");
         var brokerId = brokers.GetArrayLength() > 0 ? brokers[0].GetProperty("id").GetString()
             : (await Session.Json(await s.Post("/api/brokers", new { name = "Alpaca Paper", keyId = FakeBroker.GoodKeyId, secret = FakeBroker.GoodSecret, paper = true }))).GetProperty("id").GetString();
-        var bot = (await Session.Json(await s.Post("/api/bots", new { name = "Paused one", brokerId, allocated = 100 }))).GetProperty("id").GetString();
+        var bot = (await Session.Json(await s.Post("/api/bots", new { name = "Paused one", brokerId, allocationPct = 1 }))).GetProperty("id").GetString();
         var key = (await Session.Json(await s.Post("/api/keys", new { name = "k", brokerId, botId = bot, perms = new[] { "read", "trade" }, expiresInDays = 30 }))).GetProperty("secret").GetString()!;
         var client = new OpenTradeClient("http://localhost", key, _f.CreateClient());
         Assert.True((await client.GetBot()).Running);

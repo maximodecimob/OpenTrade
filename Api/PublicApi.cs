@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using Microsoft.EntityFrameworkCore;
 
@@ -10,6 +11,7 @@ namespace OpenTrade.Api;
 public static class PublicApi
 {
     sealed record Caller(ApiKey Key, Broker Broker, Bot? Bot);
+    static readonly ConcurrentDictionary<string, long> Hits = new();
 
     static string? Secret(HttpContext c)
     {
@@ -32,10 +34,16 @@ public static class PublicApi
         var broker = await db.Brokers.FirstOrDefaultAsync(b => b.Id == key.BrokerId);
         if (broker is null) return (null, Endpoints.Err(401, "The broker account of this key no longer exists"));
         var bot = key.BotId is null ? null : await db.Bots.FirstOrDefaultAsync(b => b.Id == key.BotId);
-        key.LastUsedMs = Clock.Now;
-        key.Requests++;
-        if (bot is not null) bot.LastHeartbeatMs = Clock.Now;
-        await db.SaveChangesAsync();
+        // Usage stats are counted in memory and written at most every 10 s per key, so a busy bot does not cause one database write per request.
+        var hits = Hits.AddOrUpdate(key.Id, 1, (_, n) => n + 1);
+        var now = Clock.Now;
+        if (key.LastUsedMs is not { } last || now - last >= 10_000)
+        {
+            key.LastUsedMs = now;
+            key.Requests += Hits.TryRemove(key.Id, out var taken) ? taken : hits;
+            if (bot is not null) bot.LastHeartbeatMs = now;
+            await db.SaveChangesAsync();
+        }
         return (new Caller(key, broker, bot), null);
     }
 
@@ -58,18 +66,22 @@ public static class PublicApi
             var (a, fail) = await Gate(c, db, "read");
             if (a is null) return fail!;
             var acc = await hub.Account(a.Broker);
+            if (a.Bot is not null) Alloc.Apply([a.Bot], new Dictionary<string, decimal> { [a.Broker.Id] = acc.Equity });
             return Results.Ok(new
             {
                 broker = a.Broker.Name, paper = a.Broker.Paper, accountNumber = acc.Number, acc.Status, acc.Equity, acc.Cash, acc.BuyingPower,
-                bot = a.Bot is null ? null : new { a.Bot.Id, a.Bot.Name, a.Bot.Running, a.Bot.Allocated },
+                bot = a.Bot is null ? null : new { a.Bot.Id, a.Bot.Name, a.Bot.Running, a.Bot.Allocated, allocationPct = a.Bot.AllocPct },
             });
         });
 
-        v1.MapGet("/bot", async (HttpContext c, OtDb db) =>
+        v1.MapGet("/bot", async (HttpContext c, OtDb db, BrokerHub hub) =>
         {
             var (a, fail) = await Gate(c, db, "read");
             if (a is null) return fail!;
-            return a.Bot is null ? Endpoints.Err(404, "This key is not bound to a bot") : Results.Ok(new { a.Bot.Id, a.Bot.Name, a.Bot.Running, a.Bot.Allocated, serverTime = DateTimeOffset.UtcNow });
+            if (a.Bot is null) return Endpoints.Err(404, "This key is not bound to a bot");
+            var acc = await hub.Account(a.Broker);
+            Alloc.Apply([a.Bot], new Dictionary<string, decimal> { [a.Broker.Id] = acc.Equity });
+            return Results.Ok(new { a.Bot.Id, a.Bot.Name, a.Bot.Running, a.Bot.Allocated, allocationPct = a.Bot.AllocPct, serverTime = DateTimeOffset.UtcNow });
         });
 
         v1.MapPost("/heartbeat", async (HttpContext c, OtDb db) =>
@@ -128,7 +140,16 @@ public static class PublicApi
             var (a, fail) = await Gate(c, db, "trade");
             if (a is null) return fail!;
             if (a.Bot is { Running: false }) return Endpoints.Err(423, "Bot is paused");
-            var id = "OT-" + Guid.NewGuid().ToString("N")[..10].ToUpperInvariant();
+            // Idempotency: a client that sends the same clientOrderId again (for example after a timeout) gets the first order back instead of a duplicate.
+            if (OrderService.ChooseId(r.ClientOrderId) is not { } id) return Endpoints.Err(400, "clientOrderId must be 8-48 characters: letters, digits, '-' or '_'");
+            if (!string.IsNullOrWhiteSpace(r.ClientOrderId))
+            {
+                var prior = await db.Orders.AsNoTracking().FirstOrDefaultAsync(o => o.Id == id);
+                if (prior is not null)
+                    return prior.BrokerId == a.Broker.Id && prior.BotId == a.Bot?.Id
+                        ? Results.Ok(OrderDto(prior))
+                        : Endpoints.Err(409, "That clientOrderId is already used by another order");
+            }
             var (n, error) = OrderService.Validate(r, id);
             if (n is null) return Endpoints.Err(400, error!);
             var o = await svc.Place(a.Broker, a.Bot, n, "api");

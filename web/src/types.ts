@@ -5,7 +5,7 @@ export interface Order {
 }
 export interface BotRow {
   id: string; name: string; class: string; description: string; brokerId: string; broker: string; clientId: string; paper: boolean; running: boolean;
-  allocated: number; invested: number; utilization: number; returnPct: number | null; pnl: number; realized: number; unrealized: number;
+  allocated: number; allocationPct: number; invested: number; utilization: number; returnPct: number | null; pnl: number; realized: number; unrealized: number;
   status: "running" | "paused" | "simulated"; online: boolean; heartbeat: number | null; keys: number;
 }
 export interface BrokerRow {

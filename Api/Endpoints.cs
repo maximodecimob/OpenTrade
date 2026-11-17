@@ -14,7 +14,10 @@ public sealed record ProfileReq(string? Name);
 public sealed record PasswordReq(string? Current, string? Password);
 public sealed record UserReq(string? Email, string? Name, string? Role, string? Password, bool? Active);
 public sealed record BrokerReq(string? Name, string? KeyId, string? Secret, bool Paper);
-public sealed record BotReq(string? Name, string? Class, string? Description, string? BrokerId, decimal? Allocated);
+public sealed record BotReq(string? Name, string? Class, string? Description, string? BrokerId, decimal? AllocationPct);
+public sealed record AllocationItem(string? Id, decimal? Pct);
+public sealed record AllocationsReq(AllocationItem[]? Items);
+public sealed record RegisterReq(string? Email, string? Name, string? Password);
 public sealed record KeyReq(string? Name, string? BrokerId, string? BotId, string[]? Perms, int? ExpiresInDays);
 public sealed record PlaceReq(string? BrokerId, string? BotId, string? Symbol, string? Side, string? Type, decimal? Qty, decimal? LimitPrice, string? TimeInForce);
 public sealed record CloseReq(string? BrokerId, string? Symbol);
@@ -89,13 +92,45 @@ public static partial class Endpoints
         "YTD" => ($"{Math.Max(1, DateTime.UtcNow.DayOfYear)}D", "1D"), "ALL" => ("1A", "1D"), _ => null,
     };
 
+    /// <summary>
+    /// Drops the leading points where the account had no money yet. The first deposit (for example the 100,000 USD a new paper account starts with)
+    /// is not a gain, so profit is measured from the first funded point onwards.
+    /// </summary>
+    static History FromFunding(History h)
+    {
+        var i = Array.FindIndex(h.V, v => v > 0.01);
+        h = i <= 0 ? h : new History(h.T[i..], h.V[i..]);
+        return StripFlows(h);
+    }
+
+    /// <summary>
+    /// Removes deposits and withdrawals from the curve. Trading cannot move an account by more than 20% between two consecutive points,
+    /// so a bigger jump is money moved in or out (or a broker artefact) and is subtracted from everything after it.
+    /// The curve then shows performance only: it starts at the funded value and changes with trading results.
+    /// </summary>
+    static History StripFlows(History h)
+    {
+        if (h.V.Length < 2) return h;
+        var v = new double[h.V.Length];
+        v[0] = h.V[0];
+        double offset = 0;
+        for (var i = 1; i < v.Length; i++)
+        {
+            var prev = h.V[i - 1];
+            var step = h.V[i] - prev;
+            if (prev > 0.01 && Math.Abs(step) > 0.2 * prev) offset += step;
+            v[i] = h.V[i] - offset;
+        }
+        return new History(h.T, v);
+    }
+
     /// <summary>Equity curve summed over the given brokers; only timestamps present in every account are kept.</summary>
     static async Task<(long[] T, double[] V)> Curve(BrokerHub hub, IEnumerable<Broker> brokers, string period, string tf)
     {
         var hs = new List<History>();
         foreach (var b in brokers)
         {
-            try { hs.Add(await hub.History(b, period, tf)); }
+            try { hs.Add(FromFunding(await hub.History(b, period, tf))); }
             catch (BrokerException) { /* skip broken account */ }
             catch (CryptographicException) { /* skip broken account */ }
         }
@@ -137,6 +172,39 @@ public static partial class Endpoints
             return Results.Ok(MeDto(u));
         }).RequireRateLimiting("login");
         pub.MapPost("/logout", async (HttpContext c) => { await c.SignOutAsync(); return Results.NoContent(); });
+
+        // ---------- self-registration ----------
+        // The very first account becomes the admin. Later accounts get Registration:Role (viewer by default, never admin) and can be changed by an admin.
+        // Turn it off with Registration:Enabled=false.
+        var registerLock = new SemaphoreSlim(1, 1);
+        pub.MapGet("/setup", async (OtDb db, IConfiguration cfg) => Results.Ok(new
+        {
+            firstRun = !await db.Users.AnyAsync(),
+            registration = cfg.GetValue("Registration:Enabled", true) || !await db.Users.AnyAsync(),
+        }));
+        pub.MapPost("/register", async (RegisterReq r, OtDb db, HttpContext c, IConfiguration cfg) =>
+        {
+            await registerLock.WaitAsync();
+            try
+            {
+                var first = !await db.Users.AnyAsync();
+                if (!first && !cfg.GetValue("Registration:Enabled", true)) return Err(403, "Registration is disabled. Ask an administrator to create your account.");
+                var email = r.Email?.Trim().ToLowerInvariant() ?? "";
+                if (email.Length > 254 || !EmailRx.IsMatch(email)) return Err(400, "Invalid email address");
+                if (r.Name?.Trim() is not { Length: > 0 and <= 60 } name) return Err(400, "Name is required (max 60 characters)");
+                if (Passwords.Validate(r.Password) is { } bad) return Err(400, bad);
+                if (await db.Users.AnyAsync(x => x.Email == email)) return Err(409, "A user with this email already exists");
+                var role = first ? Role.Admin
+                    : Enum.TryParse<Role>(cfg["Registration:Role"], true, out var cfgRole) && cfgRole != Role.Admin ? cfgRole : Role.Viewer;
+                var u = new User { Email = email, Name = name, Role = role };
+                (u.Salt, u.Hash) = Passwords.Create(r.Password!);
+                db.Users.Add(u);
+                await db.SaveChangesAsync();
+                await c.SignInAsync(Principal(u));
+                return Results.Json(MeDto(u), statusCode: 201);
+            }
+            finally { registerLock.Release(); }
+        }).RequireRateLimiting("login");
         pub.MapGet("/me", async (OtDb db, HttpContext c) =>
         {
             if (c.User.Identity?.IsAuthenticated != true) return Results.Unauthorized();
@@ -231,6 +299,7 @@ public static partial class Endpoints
             var classes = positions.GroupBy(p => ClassName(p.AssetClass)).Select(g => new { Name = g.Key, Pct = denom == 0 ? 0 : (double)(g.Sum(p => Math.Abs(p.MarketValue)) / denom * 100) }).ToList();
             if (denom > 0) classes.Add(new { Name = "Cash", Pct = (double)(Math.Max(0, cash) / denom * 100) });
             var bots = await db.Bots.AsNoTracking().ToListAsync();
+            Alloc.Apply(bots, Alloc.Equity(snaps));
             var l = await Load(db);
             var recent = await db.Orders.AsNoTracking().Where(o => o.Status == OrderStatus.Filled).OrderByDescending(o => o.CreatedMs).Take(5).ToListAsync();
             decimal Pct(decimal x, decimal basis) => basis == 0 ? 0 : x / basis;
@@ -242,7 +311,7 @@ public static partial class Endpoints
                 activeBots = bots.Count(b => b.Running), totalBots = bots.Count,
                 openOrders = await db.Orders.CountAsync(o => o.Status == OrderStatus.Pending || o.Status == OrderStatus.Partial),
                 positions = positions.Count, assetClasses = classes,
-                bots = bots.Where(b => b.Allocated > 0).Select(b => new { b.Id, b.Name, b.Class, b.Allocated }),
+                bots = bots.Where(b => b.AllocPct > 0).Select(b => new { b.Id, b.Name, b.Class, b.Allocated, allocationPct = b.AllocPct }),
                 orders = recent.Select(o => OrderDto(o, l)),
             });
         });
@@ -393,7 +462,7 @@ public static partial class Endpoints
                 if (bot is null || bot.BrokerId != broker.Id) return Err(400, "That bot does not trade on this broker account");
                 if (!bot.Running) return Err(423, "Bot is paused");
             }
-            var id = "OT-" + Guid.NewGuid().ToString("N")[..10].ToUpperInvariant();
+            var id = OrderService.NewId();
             var (n, error) = OrderService.Validate(new OrderRequest(r.Symbol, r.Side, r.Type, r.Qty, r.LimitPrice, r.TimeInForce), id);
             if (n is null) return Err(400, error!);
             var o = await svc.Place(broker, bot, n, "ui");
@@ -523,7 +592,7 @@ public static partial class Endpoints
             var online = b.LastHeartbeatMs is { } h && Clock.Now - h < 120_000;
             return new
             {
-                b.Id, b.Name, b.Class, b.Description, b.BrokerId, b.ClientId, b.Running, b.Allocated, paper = br?.Paper ?? true, broker = br?.Name ?? "—",
+                b.Id, b.Name, b.Class, b.Description, b.BrokerId, b.ClientId, b.Running, b.Allocated, allocationPct = b.AllocPct, paper = br?.Paper ?? true, broker = br?.Name ?? "—",
                 status = !b.Running ? "paused" : br?.Paper != false ? "simulated" : "running", online, heartbeat = b.LastHeartbeatMs, keys,
                 invested = st.Invested, utilization = b.Allocated > 0 ? (double)Math.Min(1m, st.Invested / b.Allocated) : 0d,
                 pnl = st.Pnl, realized = st.Realized, unrealized = st.Unrealized, returnPct = b.Allocated > 0 ? (double?)(st.Pnl / b.Allocated) : null,
@@ -534,7 +603,9 @@ public static partial class Endpoints
         {
             var bots = await db.Bots.AsNoTracking().OrderBy(b => b.CreatedMs).ToListAsync();
             var brokers = await db.Brokers.AsNoTracking().ToDictionaryAsync(b => b.Id);
-            var (prices, _) = await Prices(db, hub);
+            var (prices, snaps) = await Prices(db, hub);
+            var equity = Alloc.Equity(snaps);
+            Alloc.Apply(bots, equity);
             var orders = (await db.Orders.AsNoTracking().Where(o => o.BotId != null && o.Filled > 0).ToListAsync()).GroupBy(o => o.BotId!).ToDictionary(g => g.Key, g => g.ToList());
             var keyCount = (await db.ApiKeys.AsNoTracking().Where(k => k.BotId != null).Select(k => k.BotId!).ToListAsync()).GroupBy(x => x).ToDictionary(g => g.Key, g => g.Count());
             var rows = bots.Select(b => BotDto(b, brokers.GetValueOrDefault(b.BrokerId), Ledger.Compute(orders.GetValueOrDefault(b.Id) ?? [], prices), keyCount.GetValueOrDefault(b.Id))).ToList();
@@ -546,10 +617,11 @@ public static partial class Endpoints
             return Results.Ok(new
             {
                 bots = rows,
+                accounts = brokers.Values.Select(b => new { b.Id, b.Name, equity = equity.GetValueOrDefault(b.Id), bots = bots.Where(x => x.BrokerId == b.Id).Sum(x => x.AllocPct) }),
                 summary = new
                 {
-                    running = bots.Count(b => b.Running), paused = bots.Count(b => !b.Running), live = live.Count, simulated = bots.Count - live.Count, backed = bots.Count(b => b.Allocated > 0),
-                    alloc, deployed = invested, util = alloc == 0 ? 0m : Math.Min(1m, invested / alloc), pnl, pnlPct = alloc == 0 ? 0m : pnl / alloc,
+                    running = bots.Count(b => b.Running), paused = bots.Count(b => !b.Running), live = live.Count, simulated = bots.Count - live.Count, backed = bots.Count(b => b.AllocPct > 0),
+                    alloc, allocPct = bots.Sum(b => b.AllocPct), deployed = invested, util = alloc == 0 ? 0m : Math.Min(1m, invested / alloc), pnl, pnlPct = alloc == 0 ? 0m : pnl / alloc,
                 },
             });
         });
@@ -559,7 +631,8 @@ public static partial class Endpoints
             var b = await db.Bots.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id);
             if (b is null) return Err(404, "Bot not found");
             var br = await db.Brokers.AsNoTracking().FirstOrDefaultAsync(x => x.Id == b.BrokerId);
-            var (prices, _) = await Prices(db, hub, b.BrokerId);
+            var (prices, snaps) = await Prices(db, hub, b.BrokerId);
+            Alloc.Apply([b], Alloc.Equity(snaps));
             var mine = await db.Orders.AsNoTracking().Where(o => o.BotId == id).OrderByDescending(o => o.CreatedMs).ToListAsync();
             var st = Ledger.Compute(mine, prices);
             var keys = await db.ApiKeys.AsNoTracking().Where(k => k.BotId == id).ToListAsync();
@@ -573,33 +646,50 @@ public static partial class Endpoints
             });
         });
 
-        (string? Error, string Name, string Class, string Desc, decimal Alloc) CheckBot(BotReq r)
+        (string? Error, string Name, string Class, string Desc, decimal Pct) CheckBot(BotReq r)
         {
             if (r.Name?.Trim() is not { Length: > 0 and <= 60 } name) return ("Name is required (max 60 characters)", "", "", "", 0);
             var cls = r.Class?.Trim() ?? "";
             var desc = r.Description?.Trim() ?? "";
             if (cls.Length > 40 || desc.Length > 200) return ("Class or description is too long", "", "", "", 0);
-            if (r.Allocated is < 0 or > 1_000_000_000) return ("Allocation must be between 0 and 1,000,000,000", "", "", "", 0);
-            return (null, name, cls.Length == 0 ? "General" : cls, desc, r.Allocated ?? 0);
+            if (r.AllocationPct is < 0 or > 100) return ("Allocation must be a percentage between 0 and 100", "", "", "", 0);
+            return (null, name, cls.Length == 0 ? "General" : cls, desc, Math.Round(r.AllocationPct ?? 0, 2));
         }
 
         admin.MapPost("/bots", async (BotReq r, OtDb db) =>
         {
-            var (err, name, cls, desc, alloc) = CheckBot(r);
+            var (err, name, cls, desc, pct) = CheckBot(r);
             if (err is not null) return Err(400, err);
             if (r.BrokerId is null || !await db.Brokers.AnyAsync(b => b.Id == r.BrokerId)) return Err(400, "Choose a broker account");
-            var b = new Bot { Name = name, Class = cls, Description = desc, BrokerId = r.BrokerId, Allocated = alloc };
+            var others = await db.Bots.AsNoTracking().Where(x => x.BrokerId == r.BrokerId).ToListAsync();
+            var b = new Bot { Name = name, Class = cls, Description = desc, BrokerId = r.BrokerId, AllocPct = pct };
+            if (Alloc.Check([.. others, b], x => x.AllocPct) is { } over) return Err(400, over);
             db.Bots.Add(b);
             await db.SaveChangesAsync();
             return Results.Ok(new { b.Id, b.ClientId });
+        });
+        admin.MapPut("/bots/allocations", async (AllocationsReq r, OtDb db) =>
+        {
+            if (r.Items is not { Length: > 0 and <= 200 }) return Err(400, "Send at least one bot");
+            if (r.Items.Any(i => i.Id is null || i.Pct is null or < 0 or > 100)) return Err(400, "Each allocation needs a bot id and a percentage between 0 and 100");
+            if (r.Items.Select(i => i.Id).Distinct().Count() != r.Items.Length) return Err(400, "A bot appears twice");
+            var all = await db.Bots.ToListAsync();
+            var wanted = r.Items.ToDictionary(i => i.Id!, i => Math.Round(i.Pct!.Value, 2));
+            if (wanted.Keys.Any(id => all.All(b => b.Id != id))) return Err(404, "Bot not found");
+            if (Alloc.Check(all, b => wanted.GetValueOrDefault(b.Id, b.AllocPct)) is { } over) return Err(400, over);
+            foreach (var b in all.Where(b => wanted.ContainsKey(b.Id))) b.AllocPct = wanted[b.Id];
+            await db.SaveChangesAsync();
+            return Results.NoContent();
         });
         admin.MapPut("/bots/{id}", async (string id, BotReq r, OtDb db) =>
         {
             var b = await db.Bots.FirstOrDefaultAsync(x => x.Id == id);
             if (b is null) return Err(404, "Bot not found");
-            var (err, name, cls, desc, alloc) = CheckBot(r);
+            var (err, name, cls, desc, pct) = CheckBot(r);
             if (err is not null) return Err(400, err);
-            b.Name = name; b.Class = cls; b.Description = desc; b.Allocated = alloc;
+            var others = await db.Bots.AsNoTracking().Where(x => x.BrokerId == b.BrokerId && x.Id != id).ToListAsync();
+            if (Alloc.Check([.. others, new Bot { BrokerId = b.BrokerId, AllocPct = pct }], x => x.AllocPct) is { } over) return Err(400, over);
+            b.Name = name; b.Class = cls; b.Description = desc; b.AllocPct = pct;
             await db.SaveChangesAsync();
             return Results.NoContent();
         });

@@ -4,7 +4,7 @@ using OpenTrade.Bots;
 const string Help = """
 OpenTrade example bots (C#)
 
-  dotnet run --project Bots -- setup [--url URL] [--allocation 10000] [--broker "Alpaca Paper"] [--keys keys.json]
+  dotnet run --project Bots -- setup [--url URL] [--allocation-pct 10] [--broker "Alpaca Paper"] [--keys keys.json]
       Creates the three bots in OpenTrade with one API key each and saves the keys to keys.json.
       Asks for the admin login (or reads OT_ADMIN_EMAIL / OT_ADMIN_PASSWORD).
 
@@ -49,7 +49,7 @@ try
         var password = Environment.GetEnvironmentVariable("OT_ADMIN_PASSWORD");
         if (string.IsNullOrEmpty(password)) password = Setup.ReadSecret("Admin password: ");
         using var http = Setup.Admin(url);
-        var results = await Setup.Run(http, email, password, all, Dec("allocation", 10_000), opt.GetValueOrDefault("broker"), keysPath, Console.WriteLine);
+        var results = await Setup.Run(http, email, password, all, Dec("allocation-pct", 10), opt.GetValueOrDefault("broker"), keysPath, Console.WriteLine);
         foreach (var r in results) Console.WriteLine($"- {r.Name}: {r.Status}");
         Console.WriteLine($"\nKeys saved to {keysPath} (keep this file private).\nNext:  dotnet run --project Bots -- run all --dry-run --once");
         return 0;

@@ -9,7 +9,7 @@ public static class Setup
 {
     public sealed record Result(string Name, string Status);
 
-    public static async Task<List<Result>> Run(HttpClient http, string email, string password, IEnumerable<IBot> bots, decimal allocation,
+    public static async Task<List<Result>> Run(HttpClient http, string email, string password, IEnumerable<IBot> bots, decimal allocationPct,
         string? brokerName, string keysPath, Action<string> log)
     {
         async Task<JsonElement> Call(HttpMethod m, string path, object? body = null)
@@ -47,13 +47,13 @@ public static class Setup
                 results.Add(new(bot.Name, keys.ContainsKey(bot.Name) ? "already exists" : "already exists (no saved key - rotate it in API Management)"));
                 continue;
             }
-            var created = await Call(HttpMethod.Post, "api/bots", new { name = bot.Name, @class = "US equities", description = bot.Description, brokerId, allocated = allocation });
+            var created = await Call(HttpMethod.Post, "api/bots", new { name = bot.Name, @class = "US equities", description = bot.Description, brokerId, allocationPct });
             var key = await Call(HttpMethod.Post, "api/keys", new
             {
                 name = bot.Name + " key", brokerId, botId = created.GetProperty("id").GetString(), perms = new[] { "read", "positions", "trade" }, expiresInDays = 365,
             });
             keys[bot.Name] = key.GetProperty("secret").GetString()!;
-            results.Add(new(bot.Name, $"created with {allocation:N0} USD"));
+            results.Add(new(bot.Name, $"created with {allocationPct:0.##}% of the account"));
         }
         File.WriteAllText(keysPath, JsonSerializer.Serialize(keys, new JsonSerializerOptions { WriteIndented = true }));
         return results;

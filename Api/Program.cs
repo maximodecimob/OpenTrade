@@ -4,6 +4,7 @@ using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
 using OpenTrade.Api;
 
@@ -71,25 +72,29 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<OtDb>();
     db.Database.EnsureCreated();
+    SchemaUpgrade.Run(db);
     if (!db.Users.Any())
     {
-        var email = (app.Configuration["Admin:Email"] ?? "admin@admin.com").Trim().ToLowerInvariant();
+        // No credentials live in the repository. The admin comes from configuration (Admin:Email + Admin:Password, e.g. environment variables)
+        // or, when nothing is configured, the first account created from the web page or POST /api/register becomes the admin.
         var password = app.Configuration["Admin:Password"];
         if (string.IsNullOrEmpty(password))
+            Console.WriteLine($"[first start] no users yet. Open {app.Configuration["Urls"] ?? "http://localhost:5080"} and click \"Create account\": the first account becomes the administrator.");
+        else
         {
-            if (!app.Environment.IsDevelopment()) throw new InvalidOperationException("Set Admin:Password (min 12 chars) via environment or secrets to create the first admin.");
-            password = Convert.ToBase64String(RandomNumberGenerator.GetBytes(12));
+            if (Passwords.Validate(password) is { } bad) throw new InvalidOperationException("Admin:Password: " + bad);
+            var email = (app.Configuration["Admin:Email"] ?? "admin@admin.com").Trim().ToLowerInvariant();
+            var u = new User { Email = email, Name = app.Configuration["Admin:Name"] ?? "Administrator", Role = Role.Admin };
+            (u.Salt, u.Hash) = Passwords.Create(password);
+            db.Users.Add(u);
+            db.SaveChanges();
+            Console.WriteLine($"[first start] admin account created -> {email} (password from Admin:Password)");
         }
-        else if (Passwords.Validate(password) is { } bad) throw new InvalidOperationException("Admin:Password: " + bad);
-        var u = new User { Email = email, Name = app.Configuration["Admin:Name"] ?? "Administrator", Role = Role.Admin };
-        (u.Salt, u.Hash) = Passwords.Create(password);
-        db.Users.Add(u);
-        db.SaveChanges();
-        if (app.Environment.IsDevelopment()) Console.WriteLine($"[first start] admin account created -> {email} / {password}");
-        else Console.WriteLine($"[first start] admin account created -> {email} (password from Admin:Password)");
     }
 }
 
+// Only loopback proxies are trusted by default, so a client cannot fake its IP (rate limits) with X-Forwarded-For.
+app.UseForwardedHeaders(new ForwardedHeadersOptions { ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto });
 app.UseResponseCompression();
 app.Use(async (c, next) =>
 {
@@ -128,4 +133,27 @@ app.Run();
 public partial class Program
 {
     public const int V1RateLimit = 120;
+}
+
+/// <summary>Small, additive schema upgrades. The database is created with EnsureCreated (no migrations), so older files need a nudge.</summary>
+static class SchemaUpgrade
+{
+    public static void Run(OtDb db)
+    {
+        db.Database.OpenConnection();
+        try
+        {
+            var cols = new List<string>();
+            using (var cmd = db.Database.GetDbConnection().CreateCommand())
+            {
+                cmd.CommandText = "PRAGMA table_info(Bots)";
+                using var rd = cmd.ExecuteReader();
+                while (rd.Read()) cols.Add(rd.GetString(1));
+            }
+            // v1 stored a fixed USD amount (Allocated); v2 stores a percentage of the account (AllocPct). Old amounts cannot be converted without the equity, so they restart at 0%.
+            if (!cols.Contains("AllocPct")) db.Database.ExecuteSqlRaw("ALTER TABLE Bots ADD COLUMN AllocPct TEXT NOT NULL DEFAULT '0'");
+            if (cols.Contains("Allocated")) db.Database.ExecuteSqlRaw("ALTER TABLE Bots DROP COLUMN Allocated");
+        }
+        finally { db.Database.CloseConnection(); }
+    }
 }

@@ -25,8 +25,23 @@ public sealed class BrokerHub(IBrokerFactory factory, IDataProtectionProvider dp
         cache.Remove("pos:" + brokerId);
     }
 
-    Task<T> Cached<T>(string key, TimeSpan ttl, Func<Task<T>> load) =>
-        cache.GetOrCreateAsync(key, e => { e.AbsoluteExpirationRelativeToNow = ttl; return load(); })!;
+    /// <summary>Caches the running task itself, so concurrent callers share one broker call. A failed call is evicted right away.</summary>
+    Task<T> Cached<T>(string key, TimeSpan ttl, Func<Task<T>> load)
+    {
+        var t = cache.GetOrCreate(key, e => { e.AbsoluteExpirationRelativeToNow = ttl; return load(); })!;
+        if (!t.IsCompleted)
+            _ = t.ContinueWith(x => { if (x.IsFaulted || x.IsCanceled) cache.Remove(key); }, TaskScheduler.Default);
+        else if (t.IsFaulted || t.IsCanceled) cache.Remove(key);
+        return t;
+    }
+
+    /// <summary>Latest known price of a symbol (1-minute bar, falling back to the daily bar).</summary>
+    public async Task<decimal?> LastPrice(Broker b, string symbol)
+    {
+        var bars = await Bars(b, symbol, "1Min", 1);
+        if (bars.Count == 0) bars = await Bars(b, symbol, "1Day", 1);
+        return bars.Count == 0 ? null : bars[^1].Close;
+    }
 
     public Task<AccountInfo> Account(Broker b) => Cached("acct:" + b.Id, Short, () => Gateway(b).GetAccount());
     public Task<List<PositionInfo>> Positions(Broker b) => Cached("pos:" + b.Id, Short, () => Gateway(b).GetPositions());
@@ -48,6 +63,31 @@ public sealed class BrokerHub(IBrokerFactory factory, IDataProtectionProvider dp
     }))];
 }
 
+/// <summary>Turns each bot's percentage into USD, using the equity of its broker account.</summary>
+public static class Alloc
+{
+    public const decimal MaxPct = 100m;
+
+    public static void Apply(IEnumerable<Bot> bots, IReadOnlyDictionary<string, decimal> equityByBroker)
+    {
+        foreach (var b in bots) b.Allocated = Math.Round(equityByBroker.GetValueOrDefault(b.BrokerId) * b.AllocPct / 100m, 2);
+    }
+
+    public static Dictionary<string, decimal> Equity(IEnumerable<Snapshot> snaps) =>
+        snaps.Where(s => s.Account is not null).ToDictionary(s => s.Broker.Id, s => s.Account!.Equity);
+
+    /// <summary>Null when the percentages fit, otherwise the message to show.</summary>
+    public static string? Check(IEnumerable<Bot> bots, Func<Bot, decimal> pct)
+    {
+        foreach (var g in bots.GroupBy(b => b.BrokerId))
+        {
+            var total = g.Sum(pct);
+            if (total > MaxPct) return $"Allocations on one broker account cannot exceed 100% (this would be {total:0.##}%)";
+        }
+        return null;
+    }
+}
+
 public sealed record Activity(long Time, string Broker, string Event, bool Ok);
 
 public sealed class EventLog
@@ -61,11 +101,19 @@ public sealed class EventLog
     public Activity[] Latest(int n) => [.. _q.Reverse().Take(n)];
 }
 
-public sealed record OrderRequest(string? Symbol, string? Side, string? Type, decimal? Qty, decimal? LimitPrice, string? TimeInForce);
+public sealed record OrderRequest(string? Symbol, string? Side, string? Type, decimal? Qty, decimal? LimitPrice, string? TimeInForce, string? ClientOrderId = null);
 
 public sealed class OrderService(OtDb db, BrokerHub hub, EventLog log, OrderSync sync)
 {
     static readonly Regex SymbolRx = new("^[A-Z0-9./-]{1,15}$", RegexOptions.Compiled);
+    static readonly Regex ClientIdRx = new("^[A-Za-z0-9_-]{8,48}$", RegexOptions.Compiled);
+    // One order at a time per bot, so two parallel requests cannot both pass the capital check.
+    static readonly ConcurrentDictionary<string, SemaphoreSlim> BotLocks = new();
+
+    public static string NewId() => "OT-" + Guid.NewGuid().ToString("N")[..10].ToUpperInvariant();
+
+    /// <summary>The id the caller chose (idempotency key) when it is valid, otherwise a fresh one. Null when the supplied id is malformed.</summary>
+    public static string? ChooseId(string? supplied) => string.IsNullOrWhiteSpace(supplied) ? NewId() : ClientIdRx.IsMatch(supplied.Trim()) ? supplied.Trim() : null;
 
     public static (NewOrder? Order, string? Error) Validate(OrderRequest r, string clientId)
     {
@@ -83,7 +131,44 @@ public sealed class OrderService(OtDb db, BrokerHub hub, EventLog log, OrderSync
             r.Qty.Value, type == "limit" ? Math.Round(r.LimitPrice!.Value, 4) : null, tif, clientId), null);
     }
 
+    /// <summary>A bot may only spend its allocation and only sell what it holds. Throws a 422 BrokerException (answered as 409) otherwise.</summary>
+    async Task CheckBotLimits(Broker broker, Bot bot, NewOrder n, CancellationToken ct)
+    {
+        var mine = await db.Orders.AsNoTracking().Where(o => o.BotId == bot.Id && (o.Filled > 0 || o.Status == OrderStatus.Pending || o.Status == OrderStatus.Partial)).ToListAsync(ct);
+        var held = Ledger.Compute(mine.Where(o => o.Filled > 0), new Dictionary<string, decimal>()).Positions;
+        if (n.Side == Side.Sell)
+        {
+            var have = held.FirstOrDefault(p => p.Symbol == n.Symbol)?.Qty ?? 0;
+            var selling = mine.Where(o => o.Open && o.Side == Side.Sell && o.Symbol == n.Symbol).Sum(o => o.Qty - o.Filled);
+            if (n.Qty > have - selling)
+                throw new BrokerException($"The bot holds {Math.Max(0, have - selling):0.####} {n.Symbol} that is not already being sold, so it cannot sell {n.Qty:0.####}", 422);
+            return;
+        }
+        var acc = await hub.Account(broker);
+        var allocated = Math.Round(acc.Equity * bot.AllocPct / 100m, 2);
+        if (allocated <= 0) throw new BrokerException("This bot has no capital allocated. Give it a percentage in Strategies & Bots first", 422);
+        var price = n.LimitPrice ?? await hub.LastPrice(broker, n.Symbol) ?? throw new BrokerException("No price available for " + n.Symbol + ", so the order cannot be checked against the allocation", 422);
+        var committed = held.Sum(p => p.Qty * p.Avg);
+        foreach (var o in mine.Where(o => o.Open && o.Side == Side.Buy))
+            committed += (o.Qty - o.Filled) * (o.LimitPrice ?? await hub.LastPrice(broker, o.Symbol) ?? 0m);
+        var cost = n.Qty * price;
+        if (committed + cost > allocated + 0.005m)
+            throw new BrokerException($"Order exceeds the bot's allocation: it would use {committed + cost:N2} of {allocated:N2} USD ({bot.AllocPct:0.##}% of the account)", 422);
+    }
+
     public async Task<Order> Place(Broker broker, Bot? bot, NewOrder n, string source, CancellationToken ct = default)
+    {
+        var gate = bot is null ? null : BotLocks.GetOrAdd(bot.Id, _ => new SemaphoreSlim(1, 1));
+        if (gate is not null) await gate.WaitAsync(ct);
+        try
+        {
+            if (bot is not null) await CheckBotLimits(broker, bot, n, ct);
+            return await PlaceUnchecked(broker, bot, n, source, ct);
+        }
+        finally { gate?.Release(); }
+    }
+
+    async Task<Order> PlaceUnchecked(Broker broker, Bot? bot, NewOrder n, string source, CancellationToken ct)
     {
         var remote = await hub.Gateway(broker).PlaceOrder(n, ct);
         var order = await db.Orders.FirstOrDefaultAsync(o => o.BrokerOrderId == remote.Id, ct);
@@ -168,7 +253,7 @@ public sealed class OrderSync(IServiceScopeFactory sf, ILogger<OrderSync> logger
         string[] ids;
         using (var scope = sf.CreateScope())
             ids = await scope.ServiceProvider.GetRequiredService<OtDb>().Brokers.Select(b => b.Id).ToArrayAsync(ct);
-        foreach (var id in ids) await SyncBroker(id, ct);
+        await Parallel.ForEachAsync(ids, new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = ct }, async (id, t) => await SyncBroker(id, t));
     }
 
     public async Task SyncBroker(string brokerId, CancellationToken ct = default)

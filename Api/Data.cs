@@ -1,3 +1,4 @@
+using System.ComponentModel.DataAnnotations.Schema;
 using Microsoft.EntityFrameworkCore;
 
 namespace OpenTrade.Api;
@@ -47,7 +48,10 @@ public class Bot
     public string Description { get; set; } = "";
     public string BrokerId { get; set; } = "";
     public string ClientId { get; set; } = "bot_" + Guid.NewGuid().ToString("N")[..10];
-    public decimal Allocated { get; set; }
+    /// <summary>Share of the broker account's equity this bot may use (0-100). The sum over a broker's bots never exceeds 100.</summary>
+    public decimal AllocPct { get; set; }
+    /// <summary>USD value of <see cref="AllocPct"/> at the current equity. Computed on every read, never stored.</summary>
+    [NotMapped] public decimal Allocated { get; set; }
     public bool Running { get; set; } = true;
     public long CreatedMs { get; set; } = Clock.Now;
     public long? PausedMs { get; set; }

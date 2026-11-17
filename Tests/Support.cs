@@ -17,6 +17,8 @@ public sealed class FakeBroker : IBrokerGateway
     public List<PositionInfo> Positions = [new("AAPL", 10, 200m, 220m, 2200m, 200m, 0.1m, "us_equity"), new("BTC/USD", 1, 60000m, 61000m, 61000m, 1000m, 0.016m, "crypto")];
     public AccountInfo Account = new("PA123", "ACTIVE", 100_000m, 99_000m, 40_000m, 80_000m);
     public int Placed;
+    /// <summary>Optional latest price per symbol, returned for 1-minute single-bar requests (what the allocation check uses).</summary>
+    public readonly Dictionary<string, decimal> Last = [];
 
     public Task<AccountInfo> GetAccount(CancellationToken ct = default) => Task.FromResult(Account);
     public Task<List<PositionInfo>> GetPositions(CancellationToken ct = default) => Task.FromResult(Positions.ToList());
@@ -66,6 +68,7 @@ public sealed class FakeBroker : IBrokerGateway
         new("OLD", "Delisted Corp", "NYSE", "us_equity", false, false, false), new("BTC/USD", "Bitcoin", "CRYPTO", "crypto", true, false, true),
     });
     public Task<List<Bar>> GetBars(string symbol, string timeframe, int limit, CancellationToken ct = default) =>
+        timeframe == "1Min" && limit == 1 && Last.TryGetValue(symbol, out var px) ? Task.FromResult(new List<Bar> { new(1_000, px, px, px, px, 100) }) :
         Task.FromResult(Enumerable.Range(0, Math.Min(limit, 1000)).Select(i => new Bar(1_000 + i, 10 + i, 11 + i, 9 + i, BarCloseOf(symbol, i, limit), 100)).ToList());
 
     /// <summary>Per-symbol price shape: UP rises, DOWN falls, anything else rises from 10.5.</summary>
@@ -80,18 +83,23 @@ public sealed class FakeFactory(FakeBroker fake) : IBrokerFactory
         secret == FakeBroker.GoodSecret ? fake : throw new BrokerException("Alpaca rejected the API credentials", 401);
 }
 
-public sealed class ApiFactory : WebApplicationFactory<Program>
+public class ApiFactory : WebApplicationFactory<Program>
 {
     public const string Email = "admin@admin.com", Password = "correct-horse-battery";
     public readonly FakeBroker Fake = new();
+    /// <summary>False for a fresh install with no configured admin (the first registered account becomes the admin).</summary>
+    protected virtual bool SeedAdmin => true;
     readonly string _dir = Path.Combine(Path.GetTempPath(), "opentrade-tests-" + Guid.NewGuid().ToString("N"));
 
     protected override void ConfigureWebHost(IWebHostBuilder b)
     {
         b.UseEnvironment(Environments.Development);
         // UseSetting is applied before Program.cs reads configuration (ConfigureAppConfiguration is too late for minimal hosting).
-        b.UseSetting("Admin:Email", Email);
-        b.UseSetting("Admin:Password", Password);
+        if (SeedAdmin)
+        {
+            b.UseSetting("Admin:Email", Email);
+            b.UseSetting("Admin:Password", Password);
+        }
         b.UseSetting("Data:Dir", _dir);
         b.UseSetting("Sync:Enabled", "false");
         b.UseSetting("RateLimit:LoginPerMinute", "1000");
@@ -107,6 +115,11 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
         base.Dispose(disposing);
         try { Directory.Delete(_dir, true); } catch { /* sqlite may still hold the file */ }
     }
+}
+
+public sealed class EmptyFactory : ApiFactory
+{
+    protected override bool SeedAdmin => false;
 }
 
 static class ServiceExt

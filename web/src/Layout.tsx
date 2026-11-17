@@ -1,4 +1,4 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "./api";
 import { Icon, Me, PasswordInput, useMe } from "./ui";
@@ -53,23 +53,38 @@ export function Layout({ user, onLogout }: { user: Me; onLogout: () => void }) {
   );
 }
 
+interface Setup { firstRun: boolean; registration: boolean }
+
 export function Login({ onLogin }: { onLogin: (u: Me) => void }) {
-  const [err, setErr] = useState(""), [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(""), [busy, setBusy] = useState(false), [up, setUp] = useState(false), [setup, setSetup] = useState<Setup>();
+  useEffect(() => { api<Setup>("/setup").then(x => { setSetup(x); if (x.firstRun) setUp(true); }, () => {}); }, []);
   async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const f = new FormData(e.currentTarget);
     setBusy(true); setErr("");
-    try { onLogin(await api<Me>("/login", "POST", { email: f.get("email"), password: f.get("password") })); }
+    try {
+      onLogin(up
+        ? await api<Me>("/register", "POST", { email: f.get("email"), name: f.get("name"), password: f.get("password") })
+        : await api<Me>("/login", "POST", { email: f.get("email"), password: f.get("password") }));
+    }
     catch (x) { setErr((x as Error).message); setBusy(false); }
   }
   return (
     <div className="center">
-      <form className="card login" onSubmit={submit}>
+      <form className="card login" onSubmit={submit} key={up ? "up" : "in"}>
         <Logo />
-        <label>Email<input className="inp" name="email" type="email" autoComplete="username" required autoFocus maxLength={254} /></label>
-        <label>Password<PasswordInput name="password" autoComplete="current-password" required /></label>
+        {up && <p className="muted sm" style={{ margin: 0 }}>{setup?.firstRun ? "Welcome! This is a fresh install: the first account you create becomes the administrator." : "Create an account. New accounts are read-only until an administrator changes their role."}</p>}
+        {up && <label>Name<input className="inp" name="name" autoComplete="name" required maxLength={60} autoFocus /></label>}
+        <label>Email<input className="inp" name="email" type="email" autoComplete="username" required autoFocus={!up} maxLength={254} /></label>
+        <label>Password<PasswordInput name="password" autoComplete={up ? "new-password" : "current-password"} required /></label>
+        {up && <small className="muted">At least 12 characters.</small>}
         {err && <div className="err" role="alert">{err}</div>}
-        <button className="btn pri" disabled={busy} style={{ justifyContent: "center" }}>Sign in</button>
+        <button className="btn pri" disabled={busy} style={{ justifyContent: "center" }}>{up ? "Create account" : "Sign in"}</button>
+        {setup?.registration && !setup.firstRun && (
+          <button type="button" className="link" style={{ background: "none", border: 0, cursor: "pointer", fontSize: 12 }} onClick={() => { setErr(""); setUp(!up); }}>
+            {up ? "I already have an account" : "Create account"}
+          </button>
+        )}
       </form>
     </div>
   );

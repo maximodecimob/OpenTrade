@@ -100,3 +100,9 @@ select.inp{appearance:none;padding-right:30px;background:var(--inp) url(/icons/c
 .dotl{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;background:var(--sl)}.dotl.on{background:var(--gr)}
 .side-sub{font-size:11px;color:var(--mu)}
 .estimate{display:flex;flex-direction:column;gap:8px;background:var(--inp);border:1px solid var(--bd);border-radius:6px;padding:12px 14px;font-size:13px}
+
+/* capital allocation sliders */
+.alloc{display:grid;grid-template-columns:minmax(120px,1.2fr) 4fr 64px 100px;gap:14px;align-items:center;padding:9px 0;border-top:1px solid var(--bd);font-size:13px}
+.alloc .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}
+.alloc .mono,.fld input[type=range]{text-align:right}
+input[type=range]{width:100%;accent-color:var(--ac);cursor:pointer}input[type=range]:disabled{cursor:default;opacity:.6}

@@ -22,9 +22,9 @@ public class ApiTests : IClassFixture<ApiFactory>
         return (admin, (await Session.Json(r)).GetProperty("id").GetString()!);
     }
 
-    async Task<string> CreateBot(Session admin, string brokerId, string? name = null, decimal alloc = 10_000)
+    async Task<string> CreateBot(Session admin, string brokerId, string? name = null, decimal pct = 1)
     {
-        var r = await admin.Post("/api/bots", new { name = name ?? Unique("bot"), @class = "US equities", description = "test", brokerId, allocated = alloc });
+        var r = await admin.Post("/api/bots", new { name = name ?? Unique("bot"), @class = "US equities", description = "test", brokerId, allocationPct = pct });
         Assert.Equal(HttpStatusCode.OK, r.StatusCode);
         return (await Session.Json(r)).GetProperty("id").GetString()!;
     }
@@ -318,9 +318,9 @@ public class ApiTests : IClassFixture<ApiFactory>
         var (admin, brokerId) = await AdminWithBroker();
         Assert.Equal(HttpStatusCode.BadRequest, (await admin.Post("/api/bots", new { name = "", brokerId })).StatusCode);
         Assert.Equal(HttpStatusCode.BadRequest, (await admin.Post("/api/bots", new { name = "x", brokerId = "nope" })).StatusCode);
-        Assert.Equal(HttpStatusCode.BadRequest, (await admin.Post("/api/bots", new { name = "x", brokerId, allocated = -5 })).StatusCode);
-        var id = await CreateBot(admin, brokerId, "Edit me", 500);
-        Assert.Equal(HttpStatusCode.NoContent, (await admin.Put("/api/bots/" + id, new { name = "Renamed", @class = "ETFs", description = "d", allocated = 750 })).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, (await admin.Post("/api/bots", new { name = "x", brokerId, allocationPct = -5 })).StatusCode);
+        var id = await CreateBot(admin, brokerId, "Edit me", 0.5m);
+        Assert.Equal(HttpStatusCode.NoContent, (await admin.Put("/api/bots/" + id, new { name = "Renamed", @class = "ETFs", description = "d", allocationPct = 0.75 })).StatusCode);
         var b = (await admin.Get("/api/bots/" + id)).GetProperty("bot");
         Assert.Equal("Renamed", b.GetProperty("name").GetString());
         Assert.Equal(750m, b.GetProperty("allocated").GetDecimal());

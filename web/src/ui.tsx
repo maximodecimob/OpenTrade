@@ -120,16 +120,19 @@ export function LineChart({ s, fmt, hours }: { s: Series; fmt: (v: number) => st
   const all = s.bench ? [...s.v, ...s.bench] : s.v;
   const ticks = niceTicks(Math.min(...all), Math.max(...all));
   const lo = ticks[0], hi = ticks[ticks.length - 1];
-  const x = (i: number) => PL + (i / (s.v.length - 1)) * (W - PL - PR);
+  const t0 = s.t[0], span = Math.max(1, s.t[s.t.length - 1] - t0);
+  const xt = (ms: number) => PL + ((ms - t0) / span) * (W - PL - PR);
+  const x = (i: number) => xt(s.t[i]);
   const y = (v: number) => PT + (1 - (v - lo) / (hi - lo)) * (H - PT - PB);
   const path = (a: number[]) => a.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join("");
-  const xl = [0, 1, 2, 3, 4].map(k => Math.round((k / 4) * (s.t.length - 1)));
   const label = (ms: number) => (hours ? new Date(ms).toISOString().slice(11, 16) : mon(ms));
+  // Five evenly spaced moments in real time (not by point index), so market closes and weekends do not distort the axis.
+  const xl = [0, 1, 2, 3, 4].map(k => t0 + (k / 4) * span).filter((ms, k, arr) => k === 0 || label(ms) !== label(arr[k - 1]));
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="chart" role="img">
       <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#38bdf8" stopOpacity=".28" /><stop offset="1" stopColor="#38bdf8" stopOpacity="0" /></linearGradient></defs>
       {ticks.map(t => <g key={t}><line x1={PL} x2={W - PR} y1={y(t)} y2={y(t)} className="grid" /><text x={W - PR + 12} y={y(t) + 4} className="axis">{fmt(t)}</text></g>)}
-      {xl.map(i => <text key={i} x={x(i)} y={H - 6} className="axis" textAnchor={i === 0 ? "start" : i === s.t.length - 1 ? "end" : "middle"}>{label(s.t[i])}</text>)}
+      {xl.map((ms, k) => <text key={k} x={xt(ms)} y={H - 6} className="axis" textAnchor={k === 0 ? "start" : ms >= t0 + span ? "end" : "middle"}>{label(ms)}</text>)}
       <path d={`${path(s.v)}L${x(s.v.length - 1)} ${H - PB}L${x(0)} ${H - PB}Z`} fill="url(#g)" />
       {s.bench && <path d={path(s.bench)} className="bench" />}
       <path d={path(s.v)} className="line" />

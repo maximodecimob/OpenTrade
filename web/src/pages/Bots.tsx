@@ -1,22 +1,29 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, useApi } from "../api";
 import { agoMs, hms, money, money0, pct, signed, spct, tone } from "../format";
 import type { BotRow, BrokerRow, Order } from "../types";
 import { Badge, Confirm, Empty, Field, Head, Metric, Modal, Panel, Progress, StatusBadge, Table, useMe } from "../ui";
 
-interface Summary { running: number; paused: number; live: number; simulated: number; alloc: number; deployed: number; util: number; pnl: number; pnlPct: number; backed: number }
+interface Account { id: string; name: string; equity: number; bots: number }
+interface Summary { running: number; paused: number; live: number; simulated: number; alloc: number; allocPct: number; deployed: number; util: number; pnl: number; pnlPct: number; backed: number }
 
 const Heartbeat = ({ b }: { b: BotRow }) => b.heartbeat == null
   ? <span className="muted">Never</span>
   : <span className="muted"><span className={"dotl" + (b.online ? " on" : "")} />{agoMs(b.heartbeat)}</span>;
 
-function BotForm({ bot, brokers, onClose, onDone }: { bot?: BotRow; brokers: BrokerRow[]; onClose: () => void; onDone: (created?: { id: string; clientId: string }) => void }) {
+const COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#a855f7", "#ef4444", "#06b6d4", "#84cc16", "#ec4899"];
+
+function BotForm({ bot, brokers, accounts, onClose, onDone }: { bot?: BotRow; brokers: BrokerRow[]; accounts: Account[]; onClose: () => void; onDone: (created?: { id: string; clientId: string }) => void }) {
   const [err, setErr] = useState(""), [busy, setBusy] = useState(false);
+  const [brokerId, setBrokerId] = useState(bot?.brokerId ?? brokers[0]?.id ?? "");
+  const acc = accounts.find(a => a.id === brokerId);
+  const free = Math.max(0, 100 - (acc?.bots ?? 0) + (bot?.allocationPct ?? 0));   // what is left once this bot's own share is given back
+  const [pctVal, setPctVal] = useState(Math.min(bot?.allocationPct ?? 0, free));
   async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const f = new FormData(e.currentTarget);
-    const body = { name: f.get("name"), class: f.get("class"), description: f.get("description"), brokerId: f.get("brokerId") ?? bot?.brokerId, allocated: Number(f.get("allocated") || 0) };
+    const body = { name: f.get("name"), class: f.get("class"), description: f.get("description"), brokerId: bot?.brokerId ?? brokerId, allocationPct: pctVal };
     setBusy(true); setErr("");
     try {
       if (bot) { await api(`/bots/${bot.id}`, "PUT", body); onDone(); }
@@ -29,12 +36,14 @@ function BotForm({ bot, brokers, onClose, onDone }: { bot?: BotRow; brokers: Bro
         <Field label="Name"><input className="inp" name="name" defaultValue={bot?.name} required maxLength={60} autoFocus /></Field>
         <div className="row2">
           <Field label="Strategy type"><input className="inp" name="class" defaultValue={bot?.class} placeholder="e.g. US equities" maxLength={40} /></Field>
-          <Field label="Allocated capital (USD)"><input className="inp" name="allocated" type="number" min="0" step="any" defaultValue={bot?.allocated ?? 0} /></Field>
         </div>
+        <Field label={`Capital: ${pctVal.toFixed(1)}% of the account` + (acc ? ` = ${money0(acc.equity * pctVal / 100)}` : "")} hint={`Up to ${free.toFixed(1)}% is free on this broker account.`}>
+          <input type="range" min={0} max={Math.max(free, 0.1)} step={0.5} value={pctVal} onChange={e => setPctVal(Math.min(Number(e.target.value), free))} aria-label="Capital allocation in percent" disabled={free === 0} />
+        </Field>
         <Field label="Description"><input className="inp" name="description" defaultValue={bot?.description} maxLength={200} /></Field>
         {!bot && (
           <Field label="Broker account">
-            <select className="inp" name="brokerId" required>{brokers.map(b => <option key={b.id} value={b.id}>{b.name}{b.paper ? " (paper)" : ""}</option>)}</select>
+            <select className="inp" name="brokerId" required value={brokerId} onChange={e => { setBrokerId(e.target.value); setPctVal(0); }}>{brokers.map(b => <option key={b.id} value={b.id}>{b.name}{b.paper ? " (paper)" : ""}</option>)}</select>
           </Field>
         )}
         {err && <div className="err" role="alert">{err}</div>}
@@ -44,9 +53,60 @@ function BotForm({ bot, brokers, onClose, onDone }: { bot?: BotRow; brokers: Bro
   );
 }
 
+/** One slider per bot. Moving a slider can never push the account past 100%: it stops at what the other bots leave free. */
+function AllocationPanel({ bots, accounts, isAdmin, onSaved }: { bots: BotRow[]; accounts: Account[]; isAdmin: boolean; onSaved: () => void }) {
+  const saved = useMemo(() => Object.fromEntries(bots.map(b => [b.id, b.allocationPct])), [bots]);
+  const [draft, setDraft] = useState<Record<string, number>>({}), [err, setErr] = useState(""), [busy, setBusy] = useState(false);
+  const val = (b: BotRow) => draft[b.id] ?? saved[b.id] ?? 0;
+  const changed = bots.filter(b => draft[b.id] !== undefined && draft[b.id] !== saved[b.id]);
+  if (bots.length === 0) return null;
+  const move = (b: BotRow, v: number) => {
+    const others = bots.filter(x => x.brokerId === b.brokerId && x.id !== b.id).reduce((a, x) => a + val(x), 0);
+    setDraft({ ...draft, [b.id]: Math.max(0, Math.min(v, 100 - others)) });
+  };
+  async function save() {
+    setBusy(true); setErr("");
+    try { await api("/bots/allocations", "PUT", { items: changed.map(b => ({ id: b.id, pct: draft[b.id] })) }); setDraft({}); onSaved(); }
+    catch (x) { setErr((x as Error).message); }
+    setBusy(false);
+  }
+  return (
+    <Panel title="Capital allocation" note="Each bot gets a share of its broker account. The shares of one account can never add up to more than 100%.">
+      {accounts.filter(a => bots.some(b => b.brokerId === a.id)).map(a => {
+        const mine = bots.filter(b => b.brokerId === a.id);
+        const used = mine.reduce((x, b) => x + val(b), 0);
+        return (
+          <div key={a.id} style={{ marginBottom: 18 }}>
+            <div className="row" style={{ marginBottom: 8 }}><b>{a.name}</b><span className="muted sm">{money0(a.equity)} account · {used.toFixed(1)}% allocated · {(100 - used).toFixed(1)}% free</span></div>
+            <div className="seg" aria-hidden>
+              {mine.map((b, i) => <i key={b.id} style={{ flex: val(b), background: COLORS[i % COLORS.length] }} />)}
+              <i style={{ flex: Math.max(0, 100 - used), background: "var(--bd)" }} />
+            </div>
+            {mine.map((b, i) => (
+              <div className="alloc" key={b.id}>
+                <span><i className="dot" style={{ background: COLORS[i % COLORS.length] }} />{b.name}</span>
+                <input type="range" min={0} max={100} step={0.5} value={val(b)} disabled={!isAdmin || busy} onChange={e => move(b, Number(e.target.value))} aria-label={`Allocation of ${b.name}`} />
+                <span className="mono">{val(b).toFixed(1)}%</span>
+                <span className="mono muted">{money0(a.equity * val(b) / 100)}</span>
+              </div>
+            ))}
+          </div>
+        );
+      })}
+      {err && <div className="err" role="alert">{err}</div>}
+      {isAdmin && (
+        <div className="actions" style={{ justifyContent: "flex-end" }}>
+          <button className="btn" disabled={!changed.length || busy} onClick={() => setDraft({})}>Reset</button>
+          <button className="btn pri" disabled={!changed.length || busy} onClick={save}>Save allocation</button>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
 export function Bots() {
   const { isAdmin, canTrade } = useMe();
-  const [d, reload] = useApi<{ bots: BotRow[]; summary: Summary }>("/bots", 5000);
+  const [d, reload] = useApi<{ bots: BotRow[]; summary: Summary; accounts: Account[] }>("/bots", 5000);
   const [brokers] = useApi<BrokerRow[]>("/brokers");
   const [q, setQ] = useState(""), [st, setSt] = useState(""), [form, setForm] = useState(false), [created, setCreated] = useState<{ id: string; clientId: string } | null>(null);
   if (!d || !brokers) return null;
@@ -61,10 +121,11 @@ export function Bots() {
       </Head>
       <div className="grid4">
         <Metric label="Bot status" value={`${s.running} running`} sub={`${s.paused} paused`} />
-        <Metric label="Capital allocated" value={money(s.alloc)} sub={`${s.backed} capital-backed strateg${s.backed === 1 ? "y" : "ies"}`} />
+        <Metric label="Capital allocated" value={money(s.alloc)} sub={`${s.allocPct.toFixed(1)}% of the account · ${s.backed} capital-backed strateg${s.backed === 1 ? "y" : "ies"}`} />
         <Metric label="Capital utilization" value={pct(s.util)} sub={`${money0(s.deployed)} held in positions`} />
         <Metric label="Bot P&L" value={signed(s.pnl)} sub={`${spct(s.pnlPct)} of allocated capital`} tone={tone(s.pnl)} />
       </div>
+      <AllocationPanel bots={d.bots} accounts={d.accounts} isAdmin={isAdmin} onSaved={reload} />
       <section className="card panel">
         <div className="tools" style={{ padding: "0 0 14px" }}>
           <input className="inp" style={{ flex: "0 0 180px" }} placeholder="Search bots…" value={q} onChange={e => setQ(e.target.value)} maxLength={40} aria-label="Search bots" />
@@ -77,7 +138,7 @@ export function Bots() {
               <div className="tr tall" key={b.id}>
                 <span><span className="name">{b.name}</span><small>{b.class} · {b.broker}</small></span>
                 <span><StatusBadge s={b.status} /></span>
-                <span className="mono">{money(b.allocated)}</span>
+                <span className="mono">{money(b.allocated)}<small>{b.allocationPct.toFixed(1)}%</small></span>
                 <span>{(b.utilization * 100).toFixed(1)}%<Progress value={b.utilization} thin color={b.paper ? "var(--pu)" : undefined} /></span>
                 <span className={b.returnPct == null ? "muted" : tone(b.pnl)}>{b.returnPct == null ? "—" : spct(b.returnPct)}</span>
                 <Heartbeat b={b} />
@@ -91,7 +152,7 @@ export function Bots() {
         )}
         <div className="row sm muted" style={{ borderTop: "1px solid var(--bd)", paddingTop: 12 }}><span>Showing {rows.length} of {d.bots.length} bots</span><span>Paused bots are refused by the API (HTTP 423)</span></div>
       </section>
-      {form && <BotForm brokers={brokers} onClose={() => setForm(false)} onDone={c => { setForm(false); setCreated(c ?? null); reload(); }} />}
+      {form && <BotForm brokers={brokers} accounts={d.accounts} onClose={() => setForm(false)} onDone={c => { setForm(false); setCreated(c ?? null); reload(); }} />}
       {created && (
         <Modal title="Bot created" onClose={() => setCreated(null)}>
           <p className="muted sm">Client ID</p><div className="secret">{created.clientId}</div>
@@ -117,7 +178,8 @@ export function BotDetail() {
   const [d, reload] = useApi<Detail>(`/bots/${id}`, 5000);
   const [edit, setEdit] = useState(false);
   const [brokers] = useApi<BrokerRow[]>("/brokers");
-  if (!d || !brokers) return null;
+  const [list] = useApi<{ accounts: Account[] }>("/bots");
+  if (!d || !brokers || !list) return null;
   const { bot: b, positions, orders, keys } = d;
   const open = orders.filter(o => o.status === "pending" || o.status === "partial");
   return (
@@ -134,7 +196,7 @@ export function BotDetail() {
         </div>
       </Head>
       <div className="grid4">
-        <Metric label="Allocated capital" value={money(b.allocated)} sub={`${money0(b.invested)} in positions · ${(b.utilization * 100).toFixed(1)}% utilization`} />
+        <Metric label="Allocated capital" value={money(b.allocated)} sub={`${b.allocationPct.toFixed(1)}% of the account · ${money0(b.invested)} in positions · ${(b.utilization * 100).toFixed(1)}% utilization`} />
         <Metric label="Total P&L" value={signed(b.pnl)} sub={b.returnPct == null ? "Allocate capital to see a return" : `${spct(b.returnPct)} of allocation`} tone={tone(b.pnl)} />
         <Metric label="Realized P&L" value={signed(b.realized)} sub="From closed trades" tone={tone(b.realized)} />
         <Metric label="Unrealized P&L" value={signed(b.unrealized)} sub="From open positions" tone={tone(b.unrealized)} />
@@ -183,7 +245,7 @@ export function BotDetail() {
           </Panel>
         </div>
       </div>
-      {edit && <BotForm bot={b} brokers={brokers} onClose={() => setEdit(false)} onDone={() => { setEdit(false); reload(); }} />}
+      {edit && <BotForm bot={b} brokers={brokers} accounts={list.accounts} onClose={() => setEdit(false)} onDone={() => { setEdit(false); reload(); }} />}
     </>
   );
 }
