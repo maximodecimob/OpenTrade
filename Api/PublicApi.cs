@@ -11,7 +11,6 @@ namespace OpenTrade.Api;
 public static class PublicApi
 {
     sealed record Caller(ApiKey Key, Broker Broker, Bot? Bot);
-    static readonly ConcurrentDictionary<string, long> Hits = new();
 
     static string? Secret(HttpContext c)
     {
@@ -25,25 +24,40 @@ public static class PublicApi
 
     static async Task<(Caller? Caller, IResult? Fail)> Gate(HttpContext c, OtDb db, string perm)
     {
+        // Wrong keys are counted per IP. Without this, every made-up key would get its own 120/min bucket.
+        var bad = c.RequestServices.GetRequiredService<BadKeyLimiter>();
+        var ip = c.Connection.RemoteIpAddress?.ToString() ?? "?";
+        if (bad.Blocked(ip)) return (null, Endpoints.Err(429, "Too many requests with a missing or invalid API key. Try again in a minute."));
         var s = Secret(c);
-        if (s is null || s.Length > 200) return (null, Endpoints.Err(401, "Missing API key. Send it as 'Authorization: Bearer <key>'."));
+        if (s is null || s.Length > 200) { bad.Failed(ip); return (null, Endpoints.Err(401, "Missing API key. Send it as 'Authorization: Bearer <key>'.")); }
         var hash = Endpoints.HashKey(s);
-        var key = await db.ApiKeys.FirstOrDefaultAsync(k => k.Hash == hash);
-        if (key is null || key.ExpiresMs < Clock.Now) return (null, Endpoints.Err(401, "Invalid or expired API key"));
+        // Key, broker and bot in one query (one round trip instead of three; this runs on every bot request).
+        var row = await (from k in db.ApiKeys
+                         where k.Hash == hash
+                         join br in db.Brokers on k.BrokerId equals br.Id into brs
+                         from br in brs.DefaultIfEmpty()
+                         join bt in db.Bots on k.BotId equals bt.Id into bts
+                         from bt in bts.DefaultIfEmpty()
+                         select new { Key = k, Broker = br, Bot = bt }).FirstOrDefaultAsync();
+        var key = row?.Key;
+        if (key is null || key.ExpiresMs < Clock.Now) { bad.Failed(ip); return (null, Endpoints.Err(401, "Invalid or expired API key")); }
         if (!key.PermList.Contains(perm)) return (null, Endpoints.Err(403, $"This key does not have the '{perm}' permission"));
-        var broker = await db.Brokers.FirstOrDefaultAsync(b => b.Id == key.BrokerId);
+        var broker = row!.Broker;
         if (broker is null) return (null, Endpoints.Err(401, "The broker account of this key no longer exists"));
-        var bot = key.BotId is null ? null : await db.Bots.FirstOrDefaultAsync(b => b.Id == key.BotId);
-        // Usage stats are counted in memory and written at most every 10 s per key, so a busy bot does not cause one database write per request.
-        var hits = Hits.AddOrUpdate(key.Id, 1, (_, n) => n + 1);
+        var bot = key.BotId is null ? null : row.Bot;
+        // Usage stats (last used, request count, bot heartbeat). The first request of a key is written at once, so a new bot shows up as
+        // online right away. After that they are counted in memory and written for all keys together every 10 s (KeyUsage), so a request
+        // that only reads never has to wait for a database write.
         var now = Clock.Now;
-        if (key.LastUsedMs is not { } last || now - last >= 10_000)
+        if (key.LastUsedMs is null)
         {
             key.LastUsedMs = now;
-            key.Requests += Hits.TryRemove(key.Id, out var taken) ? taken : hits;
+            key.Requests += 1;
             if (bot is not null) bot.LastHeartbeatMs = now;
             await db.SaveChangesAsync();
+            c.RequestServices.GetRequiredService<BrokerHub>().InvalidateViews(); // the bots page shows the new bot as online at once
         }
+        else c.RequestServices.GetRequiredService<KeyUsage>().Record(key.Id, bot?.Id, now);
         return (new Caller(key, broker, bot), null);
     }
 
@@ -99,7 +113,7 @@ public static class PublicApi
             if (a.Bot is null)
                 return Results.Ok(remote.Select(p => new { p.Symbol, p.Qty, avgEntryPrice = p.AvgEntry, currentPrice = p.Last, p.MarketValue, p.UnrealizedPl }));
             var prices = remote.ToDictionary(p => p.Symbol, p => p.Last);
-            var st = Ledger.Compute(await db.Orders.AsNoTracking().Where(o => o.BotId == a.Bot.Id && o.Filled > 0).ToListAsync(), prices);
+            var st = Ledger.Compute(await OrderService.LedgerRows(db.Orders.Where(o => o.BotId == a.Bot.Id && o.Filled > 0)).ToListAsync(), prices);
             return Results.Ok(st.Positions.Select(p => new { p.Symbol, p.Qty, avgEntryPrice = p.Avg, currentPrice = p.Last, marketValue = p.Value, unrealizedPl = p.Pnl }));
         });
 
@@ -166,4 +180,22 @@ public static class PublicApi
             return await svc.Cancel(o) is { } msg ? Endpoints.Err(409, msg) : Results.NoContent();
         });
     }
+}
+
+/// <summary>Counts requests with a missing, wrong or expired API key per IP (RateLimit:BadKeyPerMinute, default 30). Valid keys never use it.</summary>
+public sealed class BadKeyLimiter(int perMinute) : IDisposable
+{
+    readonly System.Threading.RateLimiting.PartitionedRateLimiter<string> _limiter = System.Threading.RateLimiting.PartitionedRateLimiter.Create<string, string>(ip =>
+        System.Threading.RateLimiting.RateLimitPartition.GetFixedWindowLimiter(ip, _ => new System.Threading.RateLimiting.FixedWindowRateLimiterOptions { PermitLimit = perMinute, Window = TimeSpan.FromMinutes(1) }));
+
+    /// <summary>True when this IP already used all its failed attempts for the current minute.</summary>
+    public bool Blocked(string ip)
+    {
+        using var lease = _limiter.AttemptAcquire(ip, 0);
+        return !lease.IsAcquired;
+    }
+
+    public void Failed(string ip) => _limiter.AttemptAcquire(ip, 1).Dispose();
+
+    public void Dispose() => _limiter.Dispose();
 }

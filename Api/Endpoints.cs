@@ -127,14 +127,14 @@ public static partial class Endpoints
     /// <summary>Equity curve summed over the given brokers; only timestamps present in every account are kept.</summary>
     static async Task<(long[] T, double[] V)> Curve(BrokerHub hub, IEnumerable<Broker> brokers, string period, string tf)
     {
-        var hs = new List<History>();
-        foreach (var b in brokers)
+        // All accounts at once: one after the other, 400 accounts x 30 ms to the broker would be 12 s for one dashboard.
+        var all = await Task.WhenAll(brokers.Select(async b =>
         {
-            try { hs.Add(FromFunding(await hub.History(b, period, tf))); }
-            catch (BrokerException) { /* skip broken account */ }
-            catch (CryptographicException) { /* skip broken account */ }
-        }
-        hs = hs.Where(h => h.T.Length > 0).ToList();
+            try { return FromFunding(await hub.History(b, period, tf)); }
+            catch (BrokerException) { return null; /* skip broken account */ }
+            catch (CryptographicException) { return null; /* skip broken account */ }
+        }));
+        var hs = all.OfType<History>().Where(h => h.T.Length > 0).ToList();
         if (hs.Count == 0) return ([], []);
         var sum = new SortedDictionary<long, (double V, int N)>();
         foreach (var h in hs)
@@ -152,13 +152,21 @@ public static partial class Endpoints
 
     static string ClassName(string c) => c switch { "us_equity" => "US equities", "crypto" => "Crypto", "us_option" => "Options", _ => "Other" };
 
+    /// <summary>After a change made in the web UI (pause a bot, edit an allocation, place an order...), the shared views are rebuilt on the next read.</summary>
+    static async ValueTask<object?> FreshViews(EndpointFilterInvocationContext c, EndpointFilterDelegate next)
+    {
+        var r = await next(c);
+        if (!HttpMethods.IsGet(c.HttpContext.Request.Method)) c.HttpContext.RequestServices.GetRequiredService<BrokerHub>().InvalidateViews();
+        return r;
+    }
+
     // ======================================================================
     public static void MapAppApi(this WebApplication app)
     {
         var pub = app.MapGroup("/api");
         var api = app.MapGroup("/api").RequireAuthorization();
-        var trade = app.MapGroup("/api").RequireAuthorization(p => p.RequireAuthenticatedUser().RequireRole("Admin", "Trader"));
-        var admin = app.MapGroup("/api").RequireAuthorization(p => p.RequireAuthenticatedUser().RequireRole("Admin"));
+        var trade = app.MapGroup("/api").RequireAuthorization(p => p.RequireAuthenticatedUser().RequireRole("Admin", "Trader")).AddEndpointFilter(FreshViews);
+        var admin = app.MapGroup("/api").RequireAuthorization(p => p.RequireAuthenticatedUser().RequireRole("Admin")).AddEndpointFilter(FreshViews);
 
         // ---------- session ----------
         pub.MapPost("/login", async (LoginReq r, OtDb db, HttpContext c) =>
@@ -283,7 +291,7 @@ public static partial class Endpoints
         });
 
         // ---------- dashboard / portfolios ----------
-        api.MapGet("/dashboard", async (OtDb db, BrokerHub hub) =>
+        api.MapGet("/dashboard", async (OtDb db, BrokerHub hub) => Results.Ok(await hub.View("dashboard", async () =>
         {
             var brokers = await db.Brokers.AsNoTracking().ToListAsync();
             var snaps = await hub.Snapshots(brokers);
@@ -303,7 +311,7 @@ public static partial class Endpoints
             var l = await Load(db);
             var recent = await db.Orders.AsNoTracking().Where(o => o.Status == OrderStatus.Filled).OrderByDescending(o => o.CreatedMs).Take(5).ToListAsync();
             decimal Pct(decimal x, decimal basis) => basis == 0 ? 0 : x / basis;
-            return Results.Ok(new
+            return (object)new
             {
                 brokers = brokers.Count, connected = ok.Count, errors = snaps.Where(s => s.Error is not null).Select(s => new { broker = s.Broker.Name, error = s.Error }),
                 anyLive = brokers.Any(b => !b.Paper),
@@ -312,9 +320,9 @@ public static partial class Endpoints
                 openOrders = await db.Orders.CountAsync(o => o.Status == OrderStatus.Pending || o.Status == OrderStatus.Partial),
                 positions = positions.Count, assetClasses = classes,
                 bots = bots.Where(b => b.AllocPct > 0).Select(b => new { b.Id, b.Name, b.Class, b.Allocated, allocationPct = b.AllocPct }),
-                orders = recent.Select(o => OrderDto(o, l)),
-            });
-        });
+                orders = recent.Select(o => OrderDto(o, l)).ToList(),
+            };
+        })));
 
         api.MapGet("/series/{key}", async (string key, string? range, OtDb db, BrokerHub hub) =>
         {
@@ -599,32 +607,33 @@ public static partial class Endpoints
             };
         }
 
-        api.MapGet("/bots", async (OtDb db, BrokerHub hub) =>
+        api.MapGet("/bots", async (OtDb db, BrokerHub hub) => Results.Ok(await hub.View("bots", async () =>
         {
             var bots = await db.Bots.AsNoTracking().OrderBy(b => b.CreatedMs).ToListAsync();
             var brokers = await db.Brokers.AsNoTracking().ToDictionaryAsync(b => b.Id);
             var (prices, snaps) = await Prices(db, hub);
             var equity = Alloc.Equity(snaps);
             Alloc.Apply(bots, equity);
-            var orders = (await db.Orders.AsNoTracking().Where(o => o.BotId != null && o.Filled > 0).ToListAsync()).GroupBy(o => o.BotId!).ToDictionary(g => g.Key, g => g.ToList());
+            var orders = (await OrderService.LedgerRowsWithBot(db.Orders.Where(o => o.BotId != null && o.Filled > 0)).ToListAsync()).GroupBy(o => o.BotId!).ToDictionary(g => g.Key, g => g.ToList());
             var keyCount = (await db.ApiKeys.AsNoTracking().Where(k => k.BotId != null).Select(k => k.BotId!).ToListAsync()).GroupBy(x => x).ToDictionary(g => g.Key, g => g.Count());
-            var rows = bots.Select(b => BotDto(b, brokers.GetValueOrDefault(b.BrokerId), Ledger.Compute(orders.GetValueOrDefault(b.Id) ?? [], prices), keyCount.GetValueOrDefault(b.Id))).ToList();
+            // One ledger per bot, used for the rows and the summary (it used to be computed twice).
+            var statsById = bots.ToDictionary(b => b.Id, b => Ledger.Compute(orders.GetValueOrDefault(b.Id) ?? [], prices));
+            var rows = bots.Select(b => BotDto(b, brokers.GetValueOrDefault(b.BrokerId), statsById[b.Id], keyCount.GetValueOrDefault(b.Id))).ToList();
             var live = bots.Where(b => brokers.GetValueOrDefault(b.BrokerId)?.Paper == false).ToList();
             var alloc = bots.Sum(b => b.Allocated);
-            var statsById = bots.ToDictionary(b => b.Id, b => Ledger.Compute(orders.GetValueOrDefault(b.Id) ?? [], prices));
             var invested = statsById.Values.Sum(s => s.Invested);
             var pnl = statsById.Values.Sum(s => s.Pnl);
-            return Results.Ok(new
+            return (object)new
             {
                 bots = rows,
-                accounts = brokers.Values.Select(b => new { b.Id, b.Name, equity = equity.GetValueOrDefault(b.Id), bots = bots.Where(x => x.BrokerId == b.Id).Sum(x => x.AllocPct) }),
+                accounts = brokers.Values.Select(b => new { b.Id, b.Name, equity = equity.GetValueOrDefault(b.Id), bots = bots.Where(x => x.BrokerId == b.Id).Sum(x => x.AllocPct) }).ToList(),
                 summary = new
                 {
                     running = bots.Count(b => b.Running), paused = bots.Count(b => !b.Running), live = live.Count, simulated = bots.Count - live.Count, backed = bots.Count(b => b.AllocPct > 0),
                     alloc, allocPct = bots.Sum(b => b.AllocPct), deployed = invested, util = alloc == 0 ? 0m : Math.Min(1m, invested / alloc), pnl, pnlPct = alloc == 0 ? 0m : pnl / alloc,
                 },
-            });
-        });
+            };
+        })));
 
         api.MapGet("/bots/{id}", async (string id, OtDb db, BrokerHub hub) =>
         {
@@ -734,14 +743,14 @@ public static partial class Endpoints
                 lastUsed = keys.Max(k => k.LastUsedMs), rateLimit = Program.V1RateLimit,
             });
         });
-        admin.MapPost("/keys", async (KeyReq r, OtDb db) =>
+        admin.MapPost("/keys", async (KeyReq r, OtDb db, IConfiguration cfg) =>
         {
             if (r.Name?.Trim() is not { Length: > 0 and <= 60 } name) return Err(400, "Name is required (max 60 characters)");
             if (r.Perms is not { Length: > 0 and <= 3 } || r.Perms.Any(p => !AllowedPerms.Contains(p))) return Err(400, "Choose at least one valid permission");
             var broker = r.BrokerId is null ? null : await db.Brokers.AsNoTracking().FirstOrDefaultAsync(b => b.Id == r.BrokerId);
             if (broker is null) return Err(400, "Choose a broker account");
             if (!string.IsNullOrEmpty(r.BotId) && !await db.Bots.AnyAsync(b => b.Id == r.BotId && b.BrokerId == broker.Id)) return Err(400, "That bot does not belong to this broker account");
-            if (await db.ApiKeys.CountAsync() >= 50) return Err(409, "Key limit reached");
+            if (await db.ApiKeys.CountAsync() >= cfg.GetValue("Keys:MaxCount", 50)) return Err(409, "Key limit reached");
             var days = Math.Clamp(r.ExpiresInDays ?? 90, 1, 365);
             var (secret, hash, last4) = NewSecret(broker.Paper);
             var k = new ApiKey

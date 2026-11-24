@@ -35,6 +35,19 @@ public sealed class BrokerHub(IBrokerFactory factory, IDataProtectionProvider dp
         return t;
     }
 
+    /// <summary>
+    /// Pages that are the same for every user (dashboard, bots), computed at most once per 2 seconds and shared by every open tab.
+    /// Every user sees every broker account, so without this each tab redoes the work for all accounts and all bots. Changes made in the
+    /// web UI clear it at once (<see cref="InvalidateViews"/>); orders placed by bots show up within 2 s.
+    /// </summary>
+    public Task<object> View(string name, Func<Task<object>> build) => Cached("view:" + name, TimeSpan.FromSeconds(2), build);
+
+    public void InvalidateViews()
+    {
+        cache.Remove("view:dashboard");
+        cache.Remove("view:bots");
+    }
+
     /// <summary>Latest known price of a symbol (1-minute bar, falling back to the daily bar).</summary>
     public async Task<decimal?> LastPrice(Broker b, string symbol)
     {
@@ -134,7 +147,7 @@ public sealed class OrderService(OtDb db, BrokerHub hub, EventLog log, OrderSync
     /// <summary>A bot may only spend its allocation and only sell what it holds. Throws a 422 BrokerException (answered as 409) otherwise.</summary>
     async Task CheckBotLimits(Broker broker, Bot bot, NewOrder n, CancellationToken ct)
     {
-        var mine = await db.Orders.AsNoTracking().Where(o => o.BotId == bot.Id && (o.Filled > 0 || o.Status == OrderStatus.Pending || o.Status == OrderStatus.Partial)).ToListAsync(ct);
+        var mine = await LedgerRows(db.Orders.Where(o => o.BotId == bot.Id && (o.Filled > 0 || o.Status == OrderStatus.Pending || o.Status == OrderStatus.Partial))).ToListAsync(ct);
         var held = Ledger.Compute(mine.Where(o => o.Filled > 0), new Dictionary<string, decimal>()).Positions;
         if (n.Side == Side.Sell)
         {
@@ -155,6 +168,21 @@ public sealed class OrderService(OtDb db, BrokerHub hub, EventLog log, OrderSync
         if (committed + cost > allocated + 0.005m)
             throw new BrokerException($"Order exceeds the bot's allocation: it would use {committed + cost:N2} of {allocated:N2} USD ({bot.AllocPct:0.##}% of the account)", 422);
     }
+
+    /// <summary>
+    /// Only the columns the capital check and the ledger use. A bot with thousands of fills reads all of them on every order,
+    /// so skipping the other columns (ids, timestamps, change tracking) keeps that read cheap.
+    /// </summary>
+    public static IQueryable<Order> LedgerRows(IQueryable<Order> q) => q.AsNoTracking().Select(o => new Order
+    {
+        Id = "", Symbol = o.Symbol, Side = o.Side, Type = o.Type, Qty = o.Qty, Filled = o.Filled, LimitPrice = o.LimitPrice, AvgFill = o.AvgFill, Status = o.Status, CreatedMs = o.CreatedMs,
+    });
+
+    /// <summary>Like <see cref="LedgerRows"/>, plus the bot id (for grouping many bots' orders).</summary>
+    public static IQueryable<Order> LedgerRowsWithBot(IQueryable<Order> q) => q.AsNoTracking().Select(o => new Order
+    {
+        Id = "", BotId = o.BotId, Symbol = o.Symbol, Side = o.Side, Type = o.Type, Qty = o.Qty, Filled = o.Filled, LimitPrice = o.LimitPrice, AvgFill = o.AvgFill, Status = o.Status, CreatedMs = o.CreatedMs,
+    });
 
     public async Task<Order> Place(Broker broker, Bot? bot, NewOrder n, string source, CancellationToken ct = default)
     {
@@ -343,5 +371,57 @@ public static class Ledger
             return new BotPosition(kv.Key, kv.Value.Qty, kv.Value.Avg, last, kv.Value.Qty * last, kv.Value.Qty * (last - kv.Value.Avg));
         }).OrderBy(p => p.Symbol).ToList();
         return new(pos, pos.Sum(p => p.Value), realized, pos.Sum(p => p.Pnl));
+    }
+}
+
+/// <summary>
+/// Collects API-key usage in memory and writes it every 10 s in one transaction for all keys. Before, each key wrote its own row every 10 s
+/// from inside a request: with 2,000 bots that is 200 extra write transactions per second, and those requests waited in the write queue.
+/// </summary>
+public sealed class KeyUsage(IServiceScopeFactory sf, ILogger<KeyUsage> logger) : BackgroundService
+{
+    readonly ConcurrentDictionary<string, (long Hits, long Last, string? BotId)> _pending = new();
+
+    public void Record(string keyId, string? botId, long now) =>
+        _pending.AddOrUpdate(keyId, _ => (1, now, botId), (_, v) => (v.Hits + 1, Math.Max(v.Last, now), botId));
+
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(10));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+                try { await Flush(ct); }
+                catch (Exception e) when (e is not OperationCanceledException) { logger.LogWarning(e, "Could not save API key usage"); }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    public override async Task StopAsync(CancellationToken ct)
+    {
+        await base.StopAsync(ct);
+        try { await Flush(CancellationToken.None); } catch (Exception e) { logger.LogWarning(e, "Could not save API key usage on shutdown"); }
+    }
+
+    public async Task Flush(CancellationToken ct = default)
+    {
+        if (_pending.IsEmpty) return;
+        var batch = new Dictionary<string, (long Hits, long Last, string? BotId)>();
+        foreach (var id in _pending.Keys.ToList())
+            if (_pending.TryRemove(id, out var v)) batch[id] = v;
+        using var scope = sf.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<OtDb>();
+        var ids = batch.Keys.ToList();
+        foreach (var k in await db.ApiKeys.Where(k => ids.Contains(k.Id)).ToListAsync(ct))
+        {
+            var u = batch[k.Id];
+            k.Requests += u.Hits;
+            k.LastUsedMs = Math.Max(k.LastUsedMs ?? 0, u.Last);
+        }
+        var beats = batch.Values.Where(v => v.BotId is not null).GroupBy(v => v.BotId!).ToDictionary(g => g.Key, g => g.Max(v => v.Last));
+        var botIds = beats.Keys.ToList();
+        foreach (var b in await db.Bots.Where(b => botIds.Contains(b.Id)).ToListAsync(ct))
+            b.LastHeartbeatMs = Math.Max(b.LastHeartbeatMs ?? 0, beats[b.Id]);
+        await db.SaveChangesAsync(ct);
     }
 }

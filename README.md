@@ -144,6 +144,8 @@ Api/              C# source of the web app
 web/            React source of the web interface
 Bots/           example trading bots (console app)
 Tests/          unit and integration tests
+LoadTests/      load and capacity tests (console app, see LoadTests/README.md)
+docs/           documentation (overview, architecture, load testing, hard things)
 ```
 
 ## Bot API
@@ -197,7 +199,7 @@ requests per minute per key, `502` broker unreachable.
 - No credentials are stored in the repository: the first account created becomes the admin (or the admin comes from `Admin__*` environment variables). Self-registration creates read-only accounts and can be switched off.
 - Passwords are hashed with PBKDF2-SHA256 (210,000 iterations). Broker secrets are encrypted with ASP.NET Data Protection, and API keys are stored only as SHA-256 hashes and shown once.
 - The session cookie is HttpOnly and SameSite=Strict. It is re-validated on every request, so disabled users and role changes apply immediately.
-- Every write from the browser must carry an `X-OT` header (CSRF protection). Login and account creation are rate-limited to 5 attempts per minute per IP, and the bot API to 120 requests per minute per key. Behind a reverse proxy, `X-Forwarded-For` is honoured only from the local machine.
+- Every write from the browser must carry an `X-OT` header (CSRF protection). Login and account creation are rate-limited to 5 attempts per minute per IP, the bot API to 120 requests per minute per key (each bot has its own limit, even when many bots run on one computer), requests with a wrong API key to 30 per minute per IP, and the web interface to 600 requests per minute per IP. Behind a reverse proxy, `X-Forwarded-For` is honoured only from the local machine.
 - Strict Content-Security-Policy and security headers, role-based authorization, input validation, and CSV export protected against formula injection.
 - Live (real-money) trading is **disabled** unless `Brokers:AllowLive=true` is set.
 
@@ -212,6 +214,22 @@ There are more than 90 tests:
 - strategy maths, the P&L ledger, order validation, password hashing, and Alpaca JSON parsing (against recorded responses);
 - every API endpoint, roles, API-key scoping, account creation, capital limits (percentages, spending and selling rules) and idempotent orders, using a fake broker so no Alpaca account is needed;
 - the three bots running end-to-end against the real API.
+
+## Documentation and load tests
+
+The `docs/` folder explains the app in more depth: [overview](docs/01-overview.md), [architecture](docs/02-architecture.md),
+[load testing](docs/03-load-testing.md) and [specific, interesting and hard things](docs/04-specific-interesting-and-hard-things.md).
+
+To see the maximum traffic the server handles (about 70 seconds, see [LoadTests/README.md](LoadTests/README.md)):
+
+```bash
+dotnet build LoadTests -c Release
+dotnet LoadTests/bin/Release/net10.0/OpenTrade.LoadTests.dll max
+```
+
+On my laptop (16 cores) it sustains about **1,500 bots (150 users × 10 bots), about 2,500 requests/s and 700 order operations/s**.
+The rate limits are configurable: `RateLimit:V1PerMinute` (120 per bot key), `RateLimit:GlobalPerMinute` (600 per IP, web interface),
+`RateLimit:BadKeyPerMinute` (30 wrong keys per IP), `RateLimit:LoginPerMinute` (5), and `Keys:MaxCount` (50 API keys).
 
 ## Changing the web interface
 

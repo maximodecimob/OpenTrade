@@ -17,7 +17,7 @@ var oldDir = Path.Combine(b.Environment.ContentRootPath, "Api", "data");
 if (b.Configuration["Data:Dir"] is null && !Directory.Exists(dataDir) && Directory.Exists(oldDir)) Directory.Move(oldDir, dataDir);
 Directory.CreateDirectory(dataDir);
 
-b.Services.AddDbContext<OtDb>(o => o.UseSqlite($"Data Source={Path.Combine(dataDir, "opentrade.db")}"));
+b.Services.AddDbContext<OtDb>(o => o.UseSqlite($"Data Source={Path.Combine(dataDir, "opentrade.db")}").AddInterceptors(SqliteTuning.Instance));
 var dp = b.Services.AddDataProtection().SetApplicationName("OpenTrade").PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(dataDir, "keys")));
 if (OperatingSystem.IsWindows()) dp.ProtectKeysWithDpapi(); // broker secrets are encrypted with these keys, so the key ring itself is encrypted for this Windows user
 b.Services.AddMemoryCache();
@@ -27,6 +27,8 @@ b.Services.AddSingleton<BrokerHub>();
 b.Services.AddSingleton<EventLog>();
 b.Services.AddSingleton<OrderSync>();
 b.Services.AddHostedService(sp => sp.GetRequiredService<OrderSync>());
+b.Services.AddSingleton<KeyUsage>();
+b.Services.AddHostedService(sp => sp.GetRequiredService<KeyUsage>());
 b.Services.AddScoped<OrderService>();
 b.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter(System.Text.Json.JsonNamingPolicy.CamelCase)));
 b.Services.AddResponseCompression(o => o.EnableForHttps = true);
@@ -55,14 +57,21 @@ b.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme).
     };
 });
 var loginLimit = b.Configuration.GetValue("RateLimit:LoginPerMinute", 5);
+// Defaults: the bot API (/v1) is limited per API key (120 per minute), so every bot gets its own limit even when many bots run on one
+// computer. The web interface is limited per IP (600 per minute). Wrong or missing API keys are limited per IP (30 per minute), so
+// guessing keys cannot be used to get around the per-key limit. All of them are configurable (the load tests raise them).
+var v1Limit = Program.V1RateLimit = b.Configuration.GetValue("RateLimit:V1PerMinute", 120);
+var globalLimit = b.Configuration.GetValue("RateLimit:GlobalPerMinute", 600);
+b.Services.AddSingleton(new BadKeyLimiter(b.Configuration.GetValue("RateLimit:BadKeyPerMinute", 30)));
 b.Services.AddRateLimiter(o =>
 {
     o.RejectionStatusCode = 429;
     string Ip(HttpContext c) => c.Connection.RemoteIpAddress?.ToString() ?? "?";
     o.AddPolicy("login", c => RateLimitPartition.GetFixedWindowLimiter(Ip(c), _ => new() { PermitLimit = loginLimit, Window = TimeSpan.FromMinutes(1) }));
-    o.AddPolicy("v1", c => RateLimitPartition.GetFixedWindowLimiter(PublicApi.RateKey(c), _ => new() { PermitLimit = Program.V1RateLimit, Window = TimeSpan.FromMinutes(1) }));
-    o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(c =>
-        RateLimitPartition.GetFixedWindowLimiter(Ip(c), _ => new() { PermitLimit = 600, Window = TimeSpan.FromMinutes(1) }));
+    o.AddPolicy("v1", c => RateLimitPartition.GetFixedWindowLimiter(PublicApi.RateKey(c), _ => new() { PermitLimit = v1Limit, Window = TimeSpan.FromMinutes(1) }));
+    o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(c => c.Request.Path.StartsWithSegments("/v1")
+        ? RateLimitPartition.GetNoLimiter("bot-api") // bots: only the per-key limit ("v1" policy)
+        : RateLimitPartition.GetFixedWindowLimiter(Ip(c), _ => new() { PermitLimit = globalLimit, Window = TimeSpan.FromMinutes(1) }));
 });
 
 var app = b.Build();
@@ -132,7 +141,8 @@ app.Run();
 
 public partial class Program
 {
-    public const int V1RateLimit = 120;
+    /// <summary>Requests per minute per API key on /v1 (RateLimit:V1PerMinute, default 120).</summary>
+    public static int V1RateLimit { get; set; } = 120;
 }
 
 /// <summary>Small, additive schema upgrades. The database is created with EnsureCreated (no migrations), so older files need a nudge.</summary>
@@ -153,7 +163,33 @@ static class SchemaUpgrade
             // v1 stored a fixed USD amount (Allocated); v2 stores a percentage of the account (AllocPct). Old amounts cannot be converted without the equity, so they restart at 0%.
             if (!cols.Contains("AllocPct")) db.Database.ExecuteSqlRaw("ALTER TABLE Bots ADD COLUMN AllocPct TEXT NOT NULL DEFAULT '0'");
             if (cols.Contains("Allocated")) db.Database.ExecuteSqlRaw("ALTER TABLE Bots DROP COLUMN Allocated");
+            // v3: indexes for the per-bot and per-account order queries (EnsureCreated only adds them to new files).
+            db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS IX_Orders_BotId ON Orders (BotId)");
+            db.Database.ExecuteSqlRaw("CREATE INDEX IF NOT EXISTS IX_Orders_BrokerId ON Orders (BrokerId)");
+            // WAL: readers no longer wait for a writer (and the writer does not wait for readers). The mode is stored in the file.
+            db.Database.ExecuteSqlRaw("PRAGMA journal_mode=WAL");
         }
         finally { db.Database.CloseConnection(); }
+    }
+}
+
+/// <summary>Per-connection SQLite settings. synchronous=NORMAL is the recommended (and safe) setting with WAL: a commit no longer waits for a disk flush.</summary>
+sealed class SqliteTuning : Microsoft.EntityFrameworkCore.Diagnostics.DbConnectionInterceptor
+{
+    public static readonly SqliteTuning Instance = new();
+    const string Sql = "PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;";
+
+    public override void ConnectionOpened(System.Data.Common.DbConnection c, Microsoft.EntityFrameworkCore.Diagnostics.ConnectionEndEventData e)
+    {
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = Sql;
+        cmd.ExecuteNonQuery();
+    }
+
+    public override async Task ConnectionOpenedAsync(System.Data.Common.DbConnection c, Microsoft.EntityFrameworkCore.Diagnostics.ConnectionEndEventData e, CancellationToken ct = default)
+    {
+        await using var cmd = c.CreateCommand();
+        cmd.CommandText = Sql;
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 }

@@ -101,6 +101,23 @@ public class ApiKey
 
 public class OtDb(DbContextOptions<OtDb> options) : DbContext(options)
 {
+    static readonly SemaphoreSlim WriteGate = new(1, 1);
+
+    public override int SaveChanges(bool acceptAllChangesOnSuccess)
+    {
+        WriteGate.Wait();
+        try { return base.SaveChanges(acceptAllChangesOnSuccess); }
+        finally { WriteGate.Release(); }
+    }
+
+    public override async Task<int> SaveChangesAsync(bool acceptAllChangesOnSuccess, CancellationToken ct = default)
+    {
+        if (!ChangeTracker.HasChanges()) return 0;
+        await WriteGate.WaitAsync(ct);
+        try { return await base.SaveChangesAsync(acceptAllChangesOnSuccess, ct); }
+        finally { WriteGate.Release(); }
+    }
+
     public DbSet<User> Users => Set<User>();
     public DbSet<Broker> Brokers => Set<Broker>();
     public DbSet<Bot> Bots => Set<Bot>();
@@ -115,6 +132,9 @@ public class OtDb(DbContextOptions<OtDb> options) : DbContext(options)
         {
             e.HasIndex(x => x.BrokerOrderId).IsUnique();
             e.HasIndex(x => x.CreatedMs);
+            // Every bot request filters its own orders (capital check, positions, order list), and the web UI filters by account.
+            e.HasIndex(x => x.BotId);
+            e.HasIndex(x => x.BrokerId);
             e.Property(x => x.Side).HasConversion<string>();
             e.Property(x => x.Type).HasConversion<string>();
             e.Property(x => x.Status).HasConversion<string>();
