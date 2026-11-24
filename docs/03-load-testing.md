@@ -9,7 +9,7 @@ I wanted to answer four questions:
 
 All tests were run on my laptop: 16 logical cores, 31 GB RAM, Windows 11, .NET 10, Release build.
 
-## The 1-minute demo (for the presentation)
+## The 1-minute demo
 
 ```powershell
 dotnet build LoadTests -c Release
