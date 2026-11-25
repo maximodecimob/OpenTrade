@@ -1,0 +1,11 @@
+{
+  "RateLimit": {
+    "V1PerMinute": 120,
+    "GlobalPerMinute": 600,
+    "BadKeyPerMinute": 30,
+    "LoginPerMinute": 5
+  },
+  "Keys": {
+    "MaxCount": 50
+  }
+}

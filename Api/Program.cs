@@ -9,6 +9,11 @@ using Microsoft.EntityFrameworkCore;
 using OpenTrade.Api;
 
 var b = WebApplication.CreateBuilder(args);
+// All the limits are in limits.json. It is added first, so appsettings.json, environment variables and the tests can override it.
+b.Configuration.Sources.Insert(0, new Microsoft.Extensions.Configuration.Json.JsonConfigurationSource
+{
+    Path = "limits.json", Optional = true, FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(b.Environment.ContentRootPath),
+});
 b.WebHost.ConfigureKestrel(k => k.AddServerHeader = false);
 
 var dataDir = b.Configuration["Data:Dir"] ?? Path.Combine(b.Environment.ContentRootPath, "data");
